@@ -7,14 +7,14 @@ import (
 
 type Store struct {
 	mu      sync.RWMutex
-	data    map[string]string
+	data    map[string]interface{}
 	expires map[string]time.Time
 	stopCh  chan struct{}
 }
 
 func New() *Store {
 	return &Store{
-		data:    make(map[string]string),
+		data:    make(map[string]interface{}),
 		expires: make(map[string]time.Time),
 	}
 }
@@ -58,25 +58,25 @@ func (s *Store) isExpired(key string, now time.Time) bool {
 	return ok && now.After(exp)
 }
 
-func (s *Store) Set(key, value string) {
+func (s *Store) Set(key string, value interface{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] = value
 	delete(s.expires, key)
 }
 
-func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
+func (s *Store) SetWithTTL(key string, value interface{}, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] = value
 	s.expires[key] = time.Now().Add(ttl)
 }
 
-func (s *Store) Get(key string) (string, bool) {
+func (s *Store) Get(key string) (interface{}, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.isExpired(key, time.Now()) {
-		return "", false
+		return nil, false
 	}
 	val, ok := s.data[key]
 	return val, ok
@@ -112,23 +112,17 @@ func (s *Store) Len() int {
 	return count
 }
 
-func (s *Store) All() map[string]string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	now := time.Now()
-	copy := make(map[string]string)
-	for k, v := range s.data {
-		if !s.isExpired(k, now) {
-			copy[k] = v
-		}
+func (s *Store) GetString(key string) (string, bool) {
+	val, ok := s.Get(key)
+	if !ok {
+		return "", false
 	}
-	return copy
+	str, ok := val.(string)
+	return str, ok
 }
 
-func (s *Store) Load(data map[string]string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data = data
+func (s *Store) GetType(key string) (interface{}, bool) {
+	return s.Get(key)
 }
 
 func (s *Store) Expire(key string, ttl time.Duration) bool {
@@ -139,6 +133,30 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 	}
 	s.expires[key] = time.Now().Add(ttl)
 	return true
+}
+
+func (s *Store) AllStrings() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	result := make(map[string]string)
+	for k, v := range s.data {
+		if !s.isExpired(k, now) {
+			if str, ok := v.(string); ok {
+				result[k] = str
+			}
+		}
+	}
+	return result
+}
+
+func (s *Store) LoadStrings(data map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = make(map[string]interface{}, len(data))
+	for k, v := range data {
+		s.data[k] = v
+	}
 }
 
 func (s *Store) TTL(key string) int64 {

@@ -56,7 +56,7 @@ func TestAll(t *testing.T) {
 	s := New()
 	s.Set("a", "1")
 	s.Set("b", "2")
-	all := s.All()
+	all := 	s.AllStrings()
 	if len(all) != 2 || all["a"] != "1" || all["b"] != "2" {
 		t.Fatalf("unexpected All() result: %v", all)
 	}
@@ -65,7 +65,7 @@ func TestAll(t *testing.T) {
 func TestLoad(t *testing.T) {
 	s := New()
 	data := map[string]string{"x": "10", "y": "20"}
-	s.Load(data)
+	s.LoadStrings(data)
 	if s.Len() != 2 || !s.Exists("x") || !s.Exists("y") {
 		t.Fatal("Load did not populate store correctly")
 	}

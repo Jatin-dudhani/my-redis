@@ -6,7 +6,7 @@ import (
 )
 
 func SaveToFile(s *Store, path string) error {
-	data := s.All()
+	data := s.AllStrings()
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -28,6 +28,6 @@ func LoadFromFile(path string) (*Store, error) {
 		return nil, err
 	}
 	s := New()
-	s.Load(data)
+	s.LoadStrings(data)
 	return s, nil
 }

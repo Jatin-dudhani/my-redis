@@ -119,6 +119,42 @@ func (s *Server) processRESP(v resp.Value) resp.Value {
 		return s.respTTL(args)
 	case "SAVE":
 		return s.respSave(args)
+	case "LPUSH":
+		return s.respLPush(args)
+	case "RPUSH":
+		return s.respRPush(args)
+	case "LPOP":
+		return s.respLPop(args)
+	case "RPOP":
+		return s.respRPop(args)
+	case "LRANGE":
+		return s.respLRange(args)
+	case "SADD":
+		return s.respSAdd(args)
+	case "SMEMBERS":
+		return s.respSMembers(args)
+	case "SREM":
+		return s.respSRem(args)
+	case "SISMEMBER":
+		return s.respSIsMember(args)
+	case "HSET":
+		return s.respHSet(args)
+	case "HGET":
+		return s.respHGet(args)
+	case "HDEL":
+		return s.respHDel(args)
+	case "HEXISTS":
+		return s.respHExists(args)
+	case "HGETALL":
+		return s.respHGetAll(args)
+	case "ZADD":
+		return s.respZAdd(args)
+	case "ZRANGE":
+		return s.respZRange(args)
+	case "ZREM":
+		return s.respZRem(args)
+	case "ZSCORE":
+		return s.respZScore(args)
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
@@ -176,7 +212,11 @@ func (s *Server) respGet(args []resp.Value) resp.Value {
 	if !ok {
 		return resp.Null()
 	}
-	return resp.BulkString(val)
+	str, ok := val.(string)
+	if !ok {
+		return resp.Error("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	return resp.BulkString(str)
 }
 
 func (s *Server) respDel(args []resp.Value) resp.Value {
