@@ -7,7 +7,7 @@ import (
 )
 
 type Store struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	data     map[string]interface{}
 	expires  map[string]time.Time
 	stopCh   chan struct{}
@@ -37,8 +37,8 @@ func (s *Store) SetMaxKeys(n int) {
 }
 
 func (s *Store) MaxKeys() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.maxKeys
 }
 
@@ -166,8 +166,8 @@ func (s *Store) Exists(key string) bool {
 }
 
 func (s *Store) Len() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	count := 0
 	now := time.Now()
 	for key := range s.data {
@@ -179,8 +179,8 @@ func (s *Store) Len() int {
 }
 
 func (s *Store) AllStrings() map[string]string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	now := time.Now()
 	result := make(map[string]string)
 	for k, v := range s.data {
@@ -218,8 +218,8 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 }
 
 func (s *Store) TTL(key string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if _, ok := s.data[key]; !ok {
 		return -2
 	}

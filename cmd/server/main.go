@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/macbook/my-redis/server"
+	"github.com/Jatin-dudhani/my-redis/server"
 )
 
 func main() {

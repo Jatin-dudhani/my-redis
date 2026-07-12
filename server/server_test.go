@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/macbook/my-redis/resp"
+	"github.com/Jatin-dudhani/my-redis/resp"
 )
 
 func dial(t *testing.T, s *Server) net.Conn {

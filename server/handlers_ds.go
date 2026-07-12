@@ -4,8 +4,8 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/macbook/my-redis/ds"
-	"github.com/macbook/my-redis/resp"
+	"github.com/Jatin-dudhani/my-redis/ds"
+	"github.com/Jatin-dudhani/my-redis/resp"
 )
 
 func (s *Server) respLPush(args []resp.Value) resp.Value {

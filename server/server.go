@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -9,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/macbook/my-redis/pubsub"
-	"github.com/macbook/my-redis/resp"
-	"github.com/macbook/my-redis/store"
+	"github.com/Jatin-dudhani/my-redis/pubsub"
+	"github.com/Jatin-dudhani/my-redis/resp"
+	"github.com/Jatin-dudhani/my-redis/store"
 )
 
 type Server struct {
@@ -79,6 +80,9 @@ func (s *Server) Start() error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			fmt.Printf("accept error: %v\n", err)
 			continue
 		}
@@ -226,10 +230,12 @@ func (s *Server) handleSubscribedCommand(v resp.Value, cs *clientState, wr *resp
 		wr.Write(resp.SimpleString("PONG"))
 	case "QUIT":
 		wr.Write(resp.SimpleString("OK"))
+		wr.Flush()
 		return
 	default:
 		wr.Write(resp.Error(fmt.Sprintf("ERR unknown command '%s' in subscribed mode", cmd)))
 	}
+	wr.Flush()
 }
 
 func subscribeReply(channel string, count int) resp.Value {
