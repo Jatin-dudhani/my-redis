@@ -3,7 +3,9 @@ package server
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/macbook/my-redis/resp"
 	"github.com/macbook/my-redis/store"
@@ -29,6 +31,7 @@ func (s *Server) Start() error {
 	}
 	s.ln = ln
 	fmt.Printf("server listening on %s\n", s.addr)
+	s.store.StartCleanup(100 * time.Millisecond)
 
 	for {
 		conn, err := ln.Accept()
@@ -41,6 +44,7 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() error {
+	s.store.StopCleanup()
 	return s.ln.Close()
 }
 
@@ -83,6 +87,10 @@ func (s *Server) processRESP(v resp.Value) resp.Value {
 		return s.respDel(args)
 	case "EXISTS":
 		return s.respExists(args)
+	case "EXPIRE":
+		return s.respExpire(args)
+	case "TTL":
+		return s.respTTL(args)
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
@@ -101,6 +109,34 @@ func (s *Server) respSet(args []resp.Value) resp.Value {
 	}
 	key := args[0].Str
 	value := args[1].Str
+
+	// Parse optional arguments like EX, PX, NX, XX
+	for i := 2; i < len(args); i++ {
+		opt := strings.ToUpper(args[i].Str)
+		switch opt {
+		case "EX":
+			if i+1 >= len(args) {
+				return resp.Error("ERR syntax error")
+			}
+			secs, err := strconv.ParseInt(args[i+1].Str, 10, 64)
+			if err != nil {
+				return resp.Error("ERR value is not an integer or out of range")
+			}
+			s.store.SetWithTTL(key, value, time.Duration(secs)*time.Second)
+			return resp.SimpleString("OK")
+		case "PX":
+			if i+1 >= len(args) {
+				return resp.Error("ERR syntax error")
+			}
+			millis, err := strconv.ParseInt(args[i+1].Str, 10, 64)
+			if err != nil {
+				return resp.Error("ERR value is not an integer or out of range")
+			}
+			s.store.SetWithTTL(key, value, time.Duration(millis)*time.Millisecond)
+			return resp.SimpleString("OK")
+		}
+	}
+
 	s.store.Set(key, value)
 	return resp.SimpleString("OK")
 }
@@ -141,4 +177,27 @@ func (s *Server) respExists(args []resp.Value) resp.Value {
 		}
 	}
 	return resp.Integer(count)
+}
+
+func (s *Server) respExpire(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.Error("ERR wrong number of arguments for 'EXPIRE' command")
+	}
+	secs, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	ok := s.store.Expire(args[0].Str, time.Duration(secs)*time.Second)
+	if ok {
+		return resp.Integer(1)
+	}
+	return resp.Integer(0)
+}
+
+func (s *Server) respTTL(args []resp.Value) resp.Value {
+	if len(args) != 1 {
+		return resp.Error("ERR wrong number of arguments for 'TTL' command")
+	}
+	ttl := s.store.TTL(args[0].Str)
+	return resp.Integer(ttl)
 }

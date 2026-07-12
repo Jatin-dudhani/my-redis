@@ -215,6 +215,94 @@ func TestConcurrentClients(t *testing.T) {
 	}
 }
 
+func TestSetWithEX(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+
+	reply := sendRESP(t, conn, cmd("SET", "key", "val", "EX", "1"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
+		t.Fatalf("expected +OK, got %+v", reply)
+	}
+
+	// Immediately readable
+	reply = sendRESP(t, conn, cmd("GET", "key"))
+	if reply.Typ != resp.TypeBulkString || reply.Str != "val" {
+		t.Fatalf("expected val, got %+v", reply)
+	}
+
+	// Wait for expiry and check again (use a separate connection)
+	time.Sleep(1100 * time.Millisecond)
+	conn2 := dial(t, s)
+	defer conn2.Close()
+	reply = sendRESP(t, conn2, cmd("GET", "key"))
+	if reply.Typ != resp.TypeNull {
+		t.Fatalf("expected null after expiry, got %+v", reply)
+	}
+}
+
+func TestExpireCommand(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+
+	sendRESP(t, conn, cmd("SET", "key", "val"))
+
+	reply := sendRESP(t, conn, cmd("EXPIRE", "key", "1"))
+	if reply.Typ != resp.TypeInteger || reply.Num != 1 {
+		t.Fatalf("expected :1, got %+v", reply)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	conn2 := dial(t, s)
+	defer conn2.Close()
+	reply = sendRESP(t, conn2, cmd("GET", "key"))
+	if reply.Typ != resp.TypeNull {
+		t.Fatalf("expected null after expire, got %+v", reply)
+	}
+}
+
+func TestExpireMissingKey(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+
+	reply := sendRESP(t, conn, cmd("EXPIRE", "nonexistent", "10"))
+	if reply.Typ != resp.TypeInteger || reply.Num != 0 {
+		t.Fatalf("expected :0, got %+v", reply)
+	}
+}
+
+func TestTTLCommand(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+
+	// No expiry
+	sendRESP(t, conn, cmd("SET", "key", "val"))
+	reply := sendRESP(t, conn, cmd("TTL", "key"))
+	if reply.Typ != resp.TypeInteger || reply.Num != -1 {
+		t.Fatalf("expected :-1, got %+v", reply)
+	}
+
+	// With expiry
+	sendRESP(t, conn, cmd("EXPIRE", "key", "60"))
+	reply = sendRESP(t, conn, cmd("TTL", "key"))
+	if reply.Typ != resp.TypeInteger || reply.Num <= 0 || reply.Num > 60 {
+		t.Fatalf("expected TTL 1-60, got %+v", reply)
+	}
+
+	// Missing key
+	reply = sendRESP(t, conn, cmd("TTL", "nokey"))
+	if reply.Typ != resp.TypeInteger || reply.Num != -2 {
+		t.Fatalf("expected :-2, got %+v", reply)
+	}
+}
+
 func TestProtocolError(t *testing.T) {
 	s := startServer(t)
 	defer s.Stop()
