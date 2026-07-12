@@ -9,21 +9,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/macbook/my-redis/pubsub"
 	"github.com/macbook/my-redis/resp"
 	"github.com/macbook/my-redis/store"
 )
 
 type Server struct {
-	addr   string
-	dbPath string
-	ln     net.Listener
-	store  *store.Store
+	addr    string
+	dbPath  string
+	ln      net.Listener
+	store   *store.Store
+	pubsub  *pubsub.Hub
 }
 
 type clientState struct {
-	inTx   bool
-	queue  []resp.Value
-	mu     sync.Mutex
+	inTx       bool
+	queue      []resp.Value
+	mu         sync.Mutex
+	subscribed bool
+	sub        *pubsub.Subscriber
+	channels   []string
 }
 
 func New(addr, dbPath string) *Server {
@@ -31,6 +36,7 @@ func New(addr, dbPath string) *Server {
 		addr:   addr,
 		dbPath: dbPath,
 		store:  store.New(),
+		pubsub: pubsub.NewHub(),
 	}
 	s.loadDB()
 	return s
@@ -88,19 +94,119 @@ func (s *Server) handleConn(conn net.Conn) {
 	rd := resp.NewReader(conn)
 	wr := resp.NewWriter(conn)
 	cs := &clientState{}
+	vch := make(chan resp.Value, 1)
+	errch := make(chan error, 1)
+
+	// goroutine to read from network
+	go func() {
+		for {
+			v, err := rd.Read()
+			if err != nil {
+				errch <- err
+				return
+			}
+			vch <- v
+		}
+	}()
 
 	for {
-		v, err := rd.Read()
-		if err != nil {
+		if cs.subscribed {
+			select {
+			case msg := <-cs.sub.Messages:
+				reply := resp.Array([]resp.Value{
+					resp.BulkString("message"),
+					resp.BulkString(msg.Channel),
+					resp.BulkString(msg.Payload),
+				})
+				if err := wr.Write(reply); err != nil {
+					return
+				}
+				continue
+			case v := <-vch:
+				s.handleSubscribedCommand(v, cs, wr)
+				continue
+			case <-errch:
+				return
+			}
+		}
+
+		select {
+		case v := <-vch:
+			if s.isSubscribeCommand(v) {
+				s.enterSubscribeMode(v, cs, wr)
+				continue
+			}
+			reply := s.processRESP(v, cs)
+			if err := wr.Write(reply); err != nil {
+				fmt.Printf("write error: %v\n", err)
+				return
+			}
+		case err := <-errch:
 			fmt.Printf("read from %s: %v\n", conn.RemoteAddr(), err)
 			return
 		}
-		reply := s.processRESP(v, cs)
-		if err := wr.Write(reply); err != nil {
-			fmt.Printf("write to %s: %v\n", conn.RemoteAddr(), err)
-			return
-		}
 	}
+}
+
+func (s *Server) handleSubscribedCommand(v resp.Value, cs *clientState, wr *resp.Writer) {
+	if v.Typ != resp.TypeArray || len(v.Array) == 0 {
+		return
+	}
+	cmd := strings.ToUpper(v.Array[0].Str)
+	args := v.Array[1:]
+
+	switch cmd {
+	case "SUBSCRIBE":
+		for _, a := range args {
+			ch := a.Str
+			cs.channels = append(cs.channels, ch)
+			s.pubsub.Subscribe(ch, cs.sub)
+		}
+		for _, a := range args {
+			wr.Write(subscribeReply(a.Str, len(cs.channels)))
+		}
+	case "UNSUBSCRIBE":
+		if len(args) == 0 {
+			s.pubsub.UnsubscribeAll(cs.sub)
+			for _, ch := range cs.channels {
+				wr.Write(unsubscribeReply(ch, 0))
+			}
+			cs.channels = nil
+		} else {
+			for _, a := range args {
+				ch := a.Str
+				s.pubsub.Unsubscribe(ch, cs.sub)
+				cs.channels = removeStr(cs.channels, ch)
+				wr.Write(unsubscribeReply(ch, len(cs.channels)))
+			}
+		}
+		if len(cs.channels) == 0 {
+			cs.subscribed = false
+		}
+	case "PING":
+		wr.Write(resp.SimpleString("PONG"))
+	case "QUIT":
+		wr.Write(resp.SimpleString("OK"))
+		return
+	default:
+		wr.Write(resp.Error(fmt.Sprintf("ERR unknown command '%s' in subscribed mode", cmd)))
+	}
+}
+
+func subscribeReply(channel string, count int) resp.Value {
+	return resp.Array([]resp.Value{
+		resp.BulkString("subscribe"),
+		resp.BulkString(channel),
+		resp.Integer(int64(count)),
+	})
+}
+
+func unsubscribeReply(channel string, count int) resp.Value {
+	return resp.Array([]resp.Value{
+		resp.BulkString("unsubscribe"),
+		resp.BulkString(channel),
+		resp.Integer(int64(count)),
+	})
 }
 
 func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
@@ -127,7 +233,6 @@ func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 		cs.inTx = false
 		cs.queue = nil
 		cs.mu.Unlock()
-
 		if len(queue) == 0 {
 			return resp.Array(nil)
 		}
@@ -161,6 +266,30 @@ func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 	return s.executeCommand(v)
 }
 
+func (s *Server) isSubscribeCommand(v resp.Value) bool {
+	if v.Typ != resp.TypeArray || len(v.Array) == 0 {
+		return false
+	}
+	cmd := strings.ToUpper(v.Array[0].Str)
+	return cmd == "SUBSCRIBE" || cmd == "PSUBSCRIBE"
+}
+
+func (s *Server) enterSubscribeMode(v resp.Value, cs *clientState, wr *resp.Writer) {
+	cs.subscribed = true
+	cs.sub = pubsub.NewSubscriber()
+	cs.channels = nil
+
+	for i := 1; i < len(v.Array); i++ {
+		ch := v.Array[i].Str
+		cs.channels = append(cs.channels, ch)
+		s.pubsub.Subscribe(ch, cs.sub)
+	}
+
+	for _, ch := range cs.channels {
+		wr.Write(subscribeReply(ch, len(cs.channels)))
+	}
+}
+
 func (s *Server) executeCommand(v resp.Value) resp.Value {
 	cmd := strings.ToUpper(v.Array[0].Str)
 	args := v.Array[1:]
@@ -168,6 +297,8 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 	switch cmd {
 	case "PING":
 		return s.respPing(args)
+	case "PUBLISH":
+		return s.respPublish(args)
 	case "SET":
 		return s.respSet(args)
 	case "GET":
@@ -221,6 +352,14 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
+}
+
+func (s *Server) respPublish(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.Error("ERR wrong number of arguments for 'PUBLISH' command")
+	}
+	count := s.pubsub.Publish(args[0].Str, args[1].Str)
+	return resp.Integer(int64(count))
 }
 
 func (s *Server) respPing(args []resp.Value) resp.Value {
@@ -340,4 +479,13 @@ func (s *Server) respSave(args []resp.Value) resp.Value {
 		return resp.Error(fmt.Sprintf("ERR saving DB: %v", err))
 	}
 	return resp.SimpleString("OK")
+}
+
+func removeStr(slice []string, s string) []string {
+	for i, v := range slice {
+		if v == s {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
 }
