@@ -4,16 +4,23 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+
+	"github.com/macbook/my-redis/store"
 )
 
 type Server struct {
-	addr string
-	ln   net.Listener
+	addr  string
+	ln    net.Listener
+	store *store.Store
 }
 
 func New(addr string) *Server {
-	return &Server{addr: addr}
+	return &Server{
+		addr:  addr,
+		store: store.New(),
+	}
 }
 
 func (s *Server) Start() error {
@@ -65,7 +72,63 @@ func (s *Server) processCommand(cmd string) string {
 	switch strings.ToUpper(parts[0]) {
 	case "PING":
 		return "PONG"
+	case "SET":
+		return s.cmdSet(parts[1:])
+	case "GET":
+		return s.cmdGet(parts[1:])
+	case "DEL":
+		return s.cmdDel(parts[1:])
+	case "EXISTS":
+		return s.cmdExists(parts[1:])
 	default:
 		return fmt.Sprintf("ERR unknown command '%s'", parts[0])
 	}
+}
+
+func (s *Server) cmdSet(args []string) string {
+	if len(args) < 2 {
+		return "ERR wrong number of arguments for 'SET' command"
+	}
+	key := args[0]
+	value := strings.Join(args[1:], " ")
+	s.store.Set(key, value)
+	return "OK"
+}
+
+func (s *Server) cmdGet(args []string) string {
+	if len(args) != 1 {
+		return "ERR wrong number of arguments for 'GET' command"
+	}
+	val, ok := s.store.Get(args[0])
+	if !ok {
+		return "(nil)"
+	}
+	return val
+}
+
+func (s *Server) cmdDel(args []string) string {
+	if len(args) < 1 {
+		return "ERR wrong number of arguments for 'DEL' command"
+	}
+	count := 0
+	for _, key := range args {
+		if s.store.Exists(key) {
+			s.store.Delete(key)
+			count++
+		}
+	}
+	return strconv.Itoa(count)
+}
+
+func (s *Server) cmdExists(args []string) string {
+	if len(args) < 1 {
+		return "ERR wrong number of arguments for 'EXISTS' command"
+	}
+	count := 0
+	for _, key := range args {
+		if s.store.Exists(key) {
+			count++
+		}
+	}
+	return strconv.Itoa(count)
 }
