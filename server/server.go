@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,16 +13,35 @@ import (
 )
 
 type Server struct {
-	addr  string
-	ln    net.Listener
-	store *store.Store
+	addr   string
+	dbPath string
+	ln     net.Listener
+	store  *store.Store
 }
 
-func New(addr string) *Server {
-	return &Server{
-		addr:  addr,
-		store: store.New(),
+func New(addr, dbPath string) *Server {
+	s := &Server{
+		addr:   addr,
+		dbPath: dbPath,
+		store:  store.New(),
 	}
+	s.loadDB()
+	return s
+}
+
+func (s *Server) loadDB() {
+	if s.dbPath == "" {
+		return
+	}
+	loaded, err := store.LoadFromFile(s.dbPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Printf("warning: failed to load DB: %v\n", err)
+		}
+		return
+	}
+	s.store = loaded
+	fmt.Printf("loaded %d keys from %s\n", s.store.Len(), s.dbPath)
 }
 
 func (s *Server) Start() error {
@@ -31,6 +51,9 @@ func (s *Server) Start() error {
 	}
 	s.ln = ln
 	fmt.Printf("server listening on %s\n", s.addr)
+	if s.store == nil {
+		s.store = store.New()
+	}
 	s.store.StartCleanup(100 * time.Millisecond)
 
 	for {
@@ -45,7 +68,10 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() error {
 	s.store.StopCleanup()
-	return s.ln.Close()
+	if s.ln != nil {
+		return s.ln.Close()
+	}
+	return nil
 }
 
 func (s *Server) handleConn(conn net.Conn) {
@@ -91,6 +117,8 @@ func (s *Server) processRESP(v resp.Value) resp.Value {
 		return s.respExpire(args)
 	case "TTL":
 		return s.respTTL(args)
+	case "SAVE":
+		return s.respSave(args)
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
@@ -110,7 +138,6 @@ func (s *Server) respSet(args []resp.Value) resp.Value {
 	key := args[0].Str
 	value := args[1].Str
 
-	// Parse optional arguments like EX, PX, NX, XX
 	for i := 2; i < len(args); i++ {
 		opt := strings.ToUpper(args[i].Str)
 		switch opt {
@@ -200,4 +227,14 @@ func (s *Server) respTTL(args []resp.Value) resp.Value {
 	}
 	ttl := s.store.TTL(args[0].Str)
 	return resp.Integer(ttl)
+}
+
+func (s *Server) respSave(args []resp.Value) resp.Value {
+	if s.dbPath == "" {
+		return resp.Error("ERR no DB path configured")
+	}
+	if err := store.SaveToFile(s.store, s.dbPath); err != nil {
+		return resp.Error(fmt.Sprintf("ERR saving DB: %v", err))
+	}
+	return resp.SimpleString("OK")
 }

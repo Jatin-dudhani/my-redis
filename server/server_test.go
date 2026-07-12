@@ -19,7 +19,7 @@ func dial(t *testing.T, s *Server) net.Conn {
 
 func startServer(t *testing.T) *Server {
 	t.Helper()
-	s := New(":0")
+	s := New(":0", "")
 	go func() {
 		s.Start()
 	}()
@@ -300,6 +300,54 @@ func TestTTLCommand(t *testing.T) {
 	reply = sendRESP(t, conn, cmd("TTL", "nokey"))
 	if reply.Typ != resp.TypeInteger || reply.Num != -2 {
 		t.Fatalf("expected :-2, got %+v", reply)
+	}
+}
+
+func TestSaveAndReload(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := dir + "/dump.json"
+
+	// Start server with db path, set some keys, save
+	s1 := New(":0", dbPath)
+	go s1.Start()
+	time.Sleep(50 * time.Millisecond)
+	defer s1.Stop()
+
+	conn := dial(t, s1)
+	sendRESP(t, conn, cmd("SET", "a", "1"))
+	sendRESP(t, conn, cmd("SET", "b", "2"))
+	reply := sendRESP(t, conn, cmd("SAVE"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
+		t.Fatalf("expected +OK, got %+v", reply)
+	}
+	conn.Close()
+
+	// Start a new server with same db path, verify data loaded
+	s2 := New(":0", dbPath)
+	go s2.Start()
+	time.Sleep(50 * time.Millisecond)
+	defer s2.Stop()
+
+	conn2 := dial(t, s2)
+	reply = sendRESP(t, conn2, cmd("GET", "a"))
+	if reply.Typ != resp.TypeBulkString || reply.Str != "1" {
+		t.Fatalf("expected $1\\r\\n1, got %+v", reply)
+	}
+	reply = sendRESP(t, conn2, cmd("GET", "b"))
+	if reply.Typ != resp.TypeBulkString || reply.Str != "2" {
+		t.Fatalf("expected $1\\r\\n2, got %+v", reply)
+	}
+	conn2.Close()
+}
+
+func TestSaveWithoutPath(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+	reply := sendRESP(t, conn, cmd("SAVE"))
+	if reply.Typ != resp.TypeError {
+		t.Fatalf("expected error for SAVE without db path, got %+v", reply)
 	}
 }
 

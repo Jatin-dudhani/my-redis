@@ -12,10 +12,11 @@ import (
 
 func main() {
 	port := flag.Int("port", 6379, "server port")
+	dbPath := flag.String("db", "", "path to DB file for persistence")
 	flag.Parse()
 	addr := fmt.Sprintf(":%d", *port)
 
-	srv := server.New(addr)
+	srv := server.New(addr, *dbPath)
 
 	go func() {
 		sig := make(chan os.Signal, 1)
