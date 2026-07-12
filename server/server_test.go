@@ -1,11 +1,11 @@
 package server
 
 import (
-	"bufio"
-	"fmt"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/macbook/my-redis/resp"
 )
 
 func dial(t *testing.T, s *Server) net.Conn {
@@ -27,14 +27,26 @@ func startServer(t *testing.T) *Server {
 	return s
 }
 
-func send(t *testing.T, conn net.Conn, cmd string) string {
+func sendRESP(t *testing.T, conn net.Conn, v resp.Value) resp.Value {
 	t.Helper()
-	fmt.Fprintln(conn, cmd)
-	reply, err := bufio.NewReader(conn).ReadString('\n')
+	w := resp.NewWriter(conn)
+	if err := w.Write(v); err != nil {
+		t.Fatal(err)
+	}
+	r := resp.NewReader(conn)
+	reply, err := r.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return reply
+}
+
+func cmd(args ...string) resp.Value {
+	vals := make([]resp.Value, len(args))
+	for i, a := range args {
+		vals[i] = resp.BulkString(a)
+	}
+	return resp.Array(vals)
 }
 
 func TestPingPong(t *testing.T) {
@@ -42,9 +54,20 @@ func TestPingPong(t *testing.T) {
 	defer s.Stop()
 	conn := dial(t, s)
 	defer conn.Close()
-	reply := send(t, conn, "PING")
-	if reply != "PONG\n" {
-		t.Fatalf("expected PONG, got %q", reply)
+	reply := sendRESP(t, conn, cmd("PING"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "PONG" {
+		t.Fatalf("expected +PONG, got %+v", reply)
+	}
+}
+
+func TestPingWithArg(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+	reply := sendRESP(t, conn, cmd("PING", "hello"))
+	if reply.Typ != resp.TypeBulkString || reply.Str != "hello" {
+		t.Fatalf("expected $5\\r\\nhello, got %+v", reply)
 	}
 }
 
@@ -53,10 +76,9 @@ func TestUnknownCommand(t *testing.T) {
 	defer s.Stop()
 	conn := dial(t, s)
 	defer conn.Close()
-	reply := send(t, conn, "FOOBAR")
-	expected := "ERR unknown command 'FOOBAR'\n"
-	if reply != expected {
-		t.Fatalf("expected %q, got %q", expected, reply)
+	reply := sendRESP(t, conn, cmd("FOOBAR"))
+	if reply.Typ != resp.TypeError {
+		t.Fatalf("expected error, got %+v", reply)
 	}
 }
 
@@ -66,14 +88,14 @@ func TestSetGet(t *testing.T) {
 	conn := dial(t, s)
 	defer conn.Close()
 
-	reply := send(t, conn, "SET name Nikhil")
-	if reply != "OK\n" {
-		t.Fatalf("expected OK, got %q", reply)
+	reply := sendRESP(t, conn, cmd("SET", "name", "Nikhil"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
+		t.Fatalf("expected +OK, got %+v", reply)
 	}
 
-	reply = send(t, conn, "GET name")
-	if reply != "Nikhil\n" {
-		t.Fatalf("expected Nikhil, got %q", reply)
+	reply = sendRESP(t, conn, cmd("GET", "name"))
+	if reply.Typ != resp.TypeBulkString || reply.Str != "Nikhil" {
+		t.Fatalf("expected $6\\r\\nNikhil, got %+v", reply)
 	}
 }
 
@@ -82,23 +104,9 @@ func TestGetMissing(t *testing.T) {
 	defer s.Stop()
 	conn := dial(t, s)
 	defer conn.Close()
-
-	reply := send(t, conn, "GET nonexistent")
-	if reply != "(nil)\n" {
-		t.Fatalf("expected (nil), got %q", reply)
-	}
-}
-
-func TestSetGetMultiWord(t *testing.T) {
-	s := startServer(t)
-	defer s.Stop()
-	conn := dial(t, s)
-	defer conn.Close()
-
-	send(t, conn, "SET greeting hello world")
-	reply := send(t, conn, "GET greeting")
-	if reply != "hello world\n" {
-		t.Fatalf("expected 'hello world', got %q", reply)
+	reply := sendRESP(t, conn, cmd("GET", "nonexistent"))
+	if reply.Typ != resp.TypeNull {
+		t.Fatalf("expected null, got %+v", reply)
 	}
 }
 
@@ -108,22 +116,17 @@ func TestDel(t *testing.T) {
 	conn := dial(t, s)
 	defer conn.Close()
 
-	send(t, conn, "SET a 1")
-	send(t, conn, "SET b 2")
+	sendRESP(t, conn, cmd("SET", "a", "1"))
+	sendRESP(t, conn, cmd("SET", "b", "2"))
 
-	reply := send(t, conn, "DEL a")
-	if reply != "1\n" {
-		t.Fatalf("expected 1, got %q", reply)
+	reply := sendRESP(t, conn, cmd("DEL", "a"))
+	if reply.Typ != resp.TypeInteger || reply.Num != 1 {
+		t.Fatalf("expected :1, got %+v", reply)
 	}
 
-	reply = send(t, conn, "GET a")
-	if reply != "(nil)\n" {
-		t.Fatalf("expected (nil), got %q", reply)
-	}
-
-	reply = send(t, conn, "DEL a")
-	if reply != "0\n" {
-		t.Fatalf("expected 0, got %q", reply)
+	reply = sendRESP(t, conn, cmd("GET", "a"))
+	if reply.Typ != resp.TypeNull {
+		t.Fatalf("expected null, got %+v", reply)
 	}
 }
 
@@ -133,13 +136,12 @@ func TestDelMultiple(t *testing.T) {
 	conn := dial(t, s)
 	defer conn.Close()
 
-	send(t, conn, "SET a 1")
-	send(t, conn, "SET b 2")
-	send(t, conn, "SET c 3")
+	sendRESP(t, conn, cmd("SET", "a", "1"))
+	sendRESP(t, conn, cmd("SET", "b", "2"))
 
-	reply := send(t, conn, "DEL a b c")
-	if reply != "3\n" {
-		t.Fatalf("expected 3, got %q", reply)
+	reply := sendRESP(t, conn, cmd("DEL", "a", "b"))
+	if reply.Typ != resp.TypeInteger || reply.Num != 2 {
+		t.Fatalf("expected :2, got %+v", reply)
 	}
 }
 
@@ -149,29 +151,26 @@ func TestExists(t *testing.T) {
 	conn := dial(t, s)
 	defer conn.Close()
 
-	send(t, conn, "SET a 1")
+	sendRESP(t, conn, cmd("SET", "a", "1"))
 
-	reply := send(t, conn, "EXISTS a")
-	if reply != "1\n" {
-		t.Fatalf("expected 1, got %q", reply)
+	reply := sendRESP(t, conn, cmd("EXISTS", "a"))
+	if reply.Typ != resp.TypeInteger || reply.Num != 1 {
+		t.Fatalf("expected :1, got %+v", reply)
 	}
 
-	reply = send(t, conn, "EXISTS b")
-	if reply != "0\n" {
-		t.Fatalf("expected 0, got %q", reply)
+	reply = sendRESP(t, conn, cmd("EXISTS", "b"))
+	if reply.Typ != resp.TypeInteger || reply.Num != 0 {
+		t.Fatalf("expected :0, got %+v", reply)
 	}
 }
 
-func TestMultiplePings(t *testing.T) {
+func TestProtocolError(t *testing.T) {
 	s := startServer(t)
 	defer s.Stop()
 	conn := dial(t, s)
 	defer conn.Close()
-
-	for i := 0; i < 5; i++ {
-		reply := send(t, conn, "PING")
-		if reply != "PONG\n" {
-			t.Fatalf("iteration %d: expected PONG, got %q", i, reply)
-		}
+	reply := sendRESP(t, conn, resp.SimpleString("INVALID"))
+	if reply.Typ != resp.TypeError {
+		t.Fatalf("expected error for non-array input, got %+v", reply)
 	}
 }

@@ -1,12 +1,11 @@
 package server
 
 import (
-	"bufio"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 
+	"github.com/macbook/my-redis/resp"
 	"github.com/macbook/my-redis/store"
 )
 
@@ -49,86 +48,97 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	fmt.Printf("new connection from %s\n", conn.RemoteAddr())
 
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		reply := s.processCommand(line)
-		_, err := fmt.Fprint(conn, reply+"\n")
+	rd := resp.NewReader(conn)
+	wr := resp.NewWriter(conn)
+
+	for {
+		v, err := rd.Read()
 		if err != nil {
+			fmt.Printf("read from %s: %v\n", conn.RemoteAddr(), err)
+			return
+		}
+		reply := s.processRESP(v)
+		if err := wr.Write(reply); err != nil {
 			fmt.Printf("write to %s: %v\n", conn.RemoteAddr(), err)
 			return
 		}
 	}
 }
 
-func (s *Server) processCommand(cmd string) string {
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		return ""
+func (s *Server) processRESP(v resp.Value) resp.Value {
+	if v.Typ != resp.TypeArray || len(v.Array) == 0 {
+		return resp.Error("ERR protocol error: expected array")
 	}
-	switch strings.ToUpper(parts[0]) {
+	cmd := strings.ToUpper(v.Array[0].Str)
+	args := v.Array[1:]
+
+	switch cmd {
 	case "PING":
-		return "PONG"
+		return s.respPing(args)
 	case "SET":
-		return s.cmdSet(parts[1:])
+		return s.respSet(args)
 	case "GET":
-		return s.cmdGet(parts[1:])
+		return s.respGet(args)
 	case "DEL":
-		return s.cmdDel(parts[1:])
+		return s.respDel(args)
 	case "EXISTS":
-		return s.cmdExists(parts[1:])
+		return s.respExists(args)
 	default:
-		return fmt.Sprintf("ERR unknown command '%s'", parts[0])
+		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
 }
 
-func (s *Server) cmdSet(args []string) string {
+func (s *Server) respPing(args []resp.Value) resp.Value {
+	if len(args) > 0 {
+		return resp.BulkString(args[0].Str)
+	}
+	return resp.SimpleString("PONG")
+}
+
+func (s *Server) respSet(args []resp.Value) resp.Value {
 	if len(args) < 2 {
-		return "ERR wrong number of arguments for 'SET' command"
+		return resp.Error("ERR wrong number of arguments for 'SET' command")
 	}
-	key := args[0]
-	value := strings.Join(args[1:], " ")
+	key := args[0].Str
+	value := args[1].Str
 	s.store.Set(key, value)
-	return "OK"
+	return resp.SimpleString("OK")
 }
 
-func (s *Server) cmdGet(args []string) string {
+func (s *Server) respGet(args []resp.Value) resp.Value {
 	if len(args) != 1 {
-		return "ERR wrong number of arguments for 'GET' command"
+		return resp.Error("ERR wrong number of arguments for 'GET' command")
 	}
-	val, ok := s.store.Get(args[0])
+	val, ok := s.store.Get(args[0].Str)
 	if !ok {
-		return "(nil)"
+		return resp.Null()
 	}
-	return val
+	return resp.BulkString(val)
 }
 
-func (s *Server) cmdDel(args []string) string {
+func (s *Server) respDel(args []resp.Value) resp.Value {
 	if len(args) < 1 {
-		return "ERR wrong number of arguments for 'DEL' command"
+		return resp.Error("ERR wrong number of arguments for 'DEL' command")
 	}
-	count := 0
-	for _, key := range args {
-		if s.store.Exists(key) {
-			s.store.Delete(key)
+	count := int64(0)
+	for _, arg := range args {
+		if s.store.Exists(arg.Str) {
+			s.store.Delete(arg.Str)
 			count++
 		}
 	}
-	return strconv.Itoa(count)
+	return resp.Integer(count)
 }
 
-func (s *Server) cmdExists(args []string) string {
+func (s *Server) respExists(args []resp.Value) resp.Value {
 	if len(args) < 1 {
-		return "ERR wrong number of arguments for 'EXISTS' command"
+		return resp.Error("ERR wrong number of arguments for 'EXISTS' command")
 	}
-	count := 0
-	for _, key := range args {
-		if s.store.Exists(key) {
+	count := int64(0)
+	for _, arg := range args {
+		if s.store.Exists(arg.Str) {
 			count++
 		}
 	}
-	return strconv.Itoa(count)
+	return resp.Integer(count)
 }
