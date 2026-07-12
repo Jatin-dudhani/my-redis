@@ -352,6 +352,8 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 		reply = s.respTTL(args)
 	case "SAVE":
 		reply = s.respSave(args)
+	case "MAXMEMORY":
+		reply = s.respMaxMemory(args)
 	case "REPLICAOF":
 		reply = s.respReplicaOf(args)
 	case "LPUSH":
@@ -421,6 +423,18 @@ func (s *Server) propagate(v resp.Value) {
 			delete(s.replicas, conn)
 		}
 	}
+}
+
+func (s *Server) respMaxMemory(args []resp.Value) resp.Value {
+	if len(args) != 1 {
+		return resp.Error("ERR wrong number of arguments for 'MAXMEMORY' command")
+	}
+	n, err := strconv.Atoi(args[0].Str)
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	s.store.SetMaxKeys(n)
+	return resp.SimpleString("OK")
 }
 
 func (s *Server) respReplicaOf(args []resp.Value) resp.Value {
