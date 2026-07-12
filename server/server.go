@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/macbook/my-redis/resp"
@@ -17,6 +18,12 @@ type Server struct {
 	dbPath string
 	ln     net.Listener
 	store  *store.Store
+}
+
+type clientState struct {
+	inTx   bool
+	queue  []resp.Value
+	mu     sync.Mutex
 }
 
 func New(addr, dbPath string) *Server {
@@ -80,6 +87,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	rd := resp.NewReader(conn)
 	wr := resp.NewWriter(conn)
+	cs := &clientState{}
 
 	for {
 		v, err := rd.Read()
@@ -87,7 +95,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			fmt.Printf("read from %s: %v\n", conn.RemoteAddr(), err)
 			return
 		}
-		reply := s.processRESP(v)
+		reply := s.processRESP(v, cs)
 		if err := wr.Write(reply); err != nil {
 			fmt.Printf("write to %s: %v\n", conn.RemoteAddr(), err)
 			return
@@ -95,10 +103,65 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-func (s *Server) processRESP(v resp.Value) resp.Value {
+func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 	if v.Typ != resp.TypeArray || len(v.Array) == 0 {
 		return resp.Error("ERR protocol error: expected array")
 	}
+	cmd := strings.ToUpper(v.Array[0].Str)
+
+	if cmd == "MULTI" {
+		cs.mu.Lock()
+		cs.inTx = true
+		cs.queue = nil
+		cs.mu.Unlock()
+		return resp.SimpleString("OK")
+	}
+
+	if cmd == "EXEC" {
+		cs.mu.Lock()
+		if !cs.inTx {
+			cs.mu.Unlock()
+			return resp.Error("ERR EXEC without MULTI")
+		}
+		queue := cs.queue
+		cs.inTx = false
+		cs.queue = nil
+		cs.mu.Unlock()
+
+		if len(queue) == 0 {
+			return resp.Array(nil)
+		}
+		results := make([]resp.Value, len(queue))
+		for i, qv := range queue {
+			results[i] = s.executeCommand(qv)
+		}
+		return resp.Array(results)
+	}
+
+	if cmd == "DISCARD" {
+		cs.mu.Lock()
+		if !cs.inTx {
+			cs.mu.Unlock()
+			return resp.Error("ERR DISCARD without MULTI")
+		}
+		cs.inTx = false
+		cs.queue = nil
+		cs.mu.Unlock()
+		return resp.SimpleString("OK")
+	}
+
+	cs.mu.Lock()
+	if cs.inTx {
+		cs.queue = append(cs.queue, v)
+		cs.mu.Unlock()
+		return resp.SimpleString("QUEUED")
+	}
+	cs.mu.Unlock()
+
+	return s.executeCommand(v)
+}
+
+func (s *Server) executeCommand(v resp.Value) resp.Value {
 	cmd := strings.ToUpper(v.Array[0].Str)
 	args := v.Array[1:]
 

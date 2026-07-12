@@ -351,6 +351,88 @@ func TestSaveWithoutPath(t *testing.T) {
 	}
 }
 
+func TestTransactionExec(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+
+	reply := sendRESP(t, conn, cmd("MULTI"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
+		t.Fatalf("expected +OK, got %+v", reply)
+	}
+
+	reply = sendRESP(t, conn, cmd("SET", "a", "1"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "QUEUED" {
+		t.Fatalf("expected QUEUED, got %+v", reply)
+	}
+
+	reply = sendRESP(t, conn, cmd("SET", "b", "2"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "QUEUED" {
+		t.Fatalf("expected QUEUED, got %+v", reply)
+	}
+
+	reply = sendRESP(t, conn, cmd("EXEC"))
+	if reply.Typ != resp.TypeArray || len(reply.Array) != 2 {
+		t.Fatalf("expected array of 2, got %+v", reply)
+	}
+	if reply.Array[0].Typ != resp.TypeSimpleString || reply.Array[0].Str != "OK" {
+		t.Fatalf("expected OK, got %+v", reply.Array[0])
+	}
+	if reply.Array[1].Typ != resp.TypeSimpleString || reply.Array[1].Str != "OK" {
+		t.Fatalf("expected OK, got %+v", reply.Array[1])
+	}
+
+	// Verify values were set
+	reply = sendRESP(t, conn, cmd("GET", "a"))
+	if reply.Typ != resp.TypeBulkString || reply.Str != "1" {
+		t.Fatalf("expected 1, got %+v", reply)
+	}
+}
+
+func TestTransactionDiscard(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+
+	sendRESP(t, conn, cmd("MULTI"))
+	sendRESP(t, conn, cmd("SET", "x", "100"))
+
+	reply := sendRESP(t, conn, cmd("DISCARD"))
+	if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
+		t.Fatalf("expected +OK, got %+v", reply)
+	}
+
+	// x should not have been set
+	reply = sendRESP(t, conn, cmd("GET", "x"))
+	if reply.Typ != resp.TypeNull {
+		t.Fatalf("expected null, got %+v", reply)
+	}
+}
+
+func TestExecWithoutMulti(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+	reply := sendRESP(t, conn, cmd("EXEC"))
+	if reply.Typ != resp.TypeError {
+		t.Fatalf("expected error, got %+v", reply)
+	}
+}
+
+func TestDiscardWithoutMulti(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+	conn := dial(t, s)
+	defer conn.Close()
+	reply := sendRESP(t, conn, cmd("DISCARD"))
+	if reply.Typ != resp.TypeError {
+		t.Fatalf("expected error, got %+v", reply)
+	}
+}
+
 func TestProtocolError(t *testing.T) {
 	s := startServer(t)
 	defer s.Stop()
