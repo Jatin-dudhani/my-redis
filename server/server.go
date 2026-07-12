@@ -20,6 +20,11 @@ type Server struct {
 	ln      net.Listener
 	store   *store.Store
 	pubsub  *pubsub.Hub
+
+	replicas   map[net.Conn]struct{}
+	replicaMu  sync.Mutex
+	isReplica  bool
+	masterConn net.Conn
 }
 
 type clientState struct {
@@ -29,14 +34,16 @@ type clientState struct {
 	subscribed bool
 	sub        *pubsub.Subscriber
 	channels   []string
+	isReplica  bool
 }
 
 func New(addr, dbPath string) *Server {
 	s := &Server{
-		addr:   addr,
-		dbPath: dbPath,
-		store:  store.New(),
-		pubsub: pubsub.NewHub(),
+		addr:     addr,
+		dbPath:   dbPath,
+		store:    store.New(),
+		pubsub:   pubsub.NewHub(),
+		replicas: make(map[net.Conn]struct{}),
 	}
 	s.loadDB()
 	return s
@@ -131,19 +138,41 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 
 		select {
+		case <-errch:
+			// remove from replicas on disconnect
+			s.replicaMu.Lock()
+			delete(s.replicas, conn)
+			s.replicaMu.Unlock()
+			return
 		case v := <-vch:
+			if cs.isReplica {
+				continue
+			}
+
+			if v.Typ == resp.TypeArray && len(v.Array) >= 3 {
+				cmd := strings.ToUpper(v.Array[0].Str)
+				if cmd == "REPLCONF" && strings.ToUpper(v.Array[1].Str) == "LISTENING-PORT" {
+					s.replicaMu.Lock()
+					s.replicas[conn] = struct{}{}
+					s.replicaMu.Unlock()
+					cs.isReplica = true
+					if err := wr.Write(resp.SimpleString("OK")); err != nil {
+						return
+					}
+					continue
+				}
+			}
+
 			if s.isSubscribeCommand(v) {
 				s.enterSubscribeMode(v, cs, wr)
 				continue
 			}
+
 			reply := s.processRESP(v, cs)
 			if err := wr.Write(reply); err != nil {
 				fmt.Printf("write error: %v\n", err)
 				return
 			}
-		case err := <-errch:
-			fmt.Printf("read from %s: %v\n", conn.RemoteAddr(), err)
-			return
 		}
 	}
 }
@@ -290,67 +319,159 @@ func (s *Server) enterSubscribeMode(v resp.Value, cs *clientState, wr *resp.Writ
 	}
 }
 
+var writeCommands = map[string]bool{
+	"SET": true, "DEL": true, "EXPIRE": true,
+	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true,
+	"SADD": true, "SREM": true,
+	"HSET": true, "HDEL": true,
+	"ZADD": true, "ZREM": true,
+}
+
 func (s *Server) executeCommand(v resp.Value) resp.Value {
 	cmd := strings.ToUpper(v.Array[0].Str)
 	args := v.Array[1:]
 
+	var reply resp.Value
+
 	switch cmd {
 	case "PING":
-		return s.respPing(args)
+		reply = s.respPing(args)
 	case "PUBLISH":
-		return s.respPublish(args)
+		reply = s.respPublish(args)
 	case "SET":
-		return s.respSet(args)
+		reply = s.respSet(args)
 	case "GET":
-		return s.respGet(args)
+		reply = s.respGet(args)
 	case "DEL":
-		return s.respDel(args)
+		reply = s.respDel(args)
 	case "EXISTS":
-		return s.respExists(args)
+		reply = s.respExists(args)
 	case "EXPIRE":
-		return s.respExpire(args)
+		reply = s.respExpire(args)
 	case "TTL":
-		return s.respTTL(args)
+		reply = s.respTTL(args)
 	case "SAVE":
-		return s.respSave(args)
+		reply = s.respSave(args)
+	case "REPLICAOF":
+		reply = s.respReplicaOf(args)
 	case "LPUSH":
-		return s.respLPush(args)
+		reply = s.respLPush(args)
 	case "RPUSH":
-		return s.respRPush(args)
+		reply = s.respRPush(args)
 	case "LPOP":
-		return s.respLPop(args)
+		reply = s.respLPop(args)
 	case "RPOP":
-		return s.respRPop(args)
+		reply = s.respRPop(args)
 	case "LRANGE":
-		return s.respLRange(args)
+		reply = s.respLRange(args)
 	case "SADD":
-		return s.respSAdd(args)
+		reply = s.respSAdd(args)
 	case "SMEMBERS":
-		return s.respSMembers(args)
+		reply = s.respSMembers(args)
 	case "SREM":
-		return s.respSRem(args)
+		reply = s.respSRem(args)
 	case "SISMEMBER":
-		return s.respSIsMember(args)
+		reply = s.respSIsMember(args)
 	case "HSET":
-		return s.respHSet(args)
+		reply = s.respHSet(args)
 	case "HGET":
-		return s.respHGet(args)
+		reply = s.respHGet(args)
 	case "HDEL":
-		return s.respHDel(args)
+		reply = s.respHDel(args)
 	case "HEXISTS":
-		return s.respHExists(args)
+		reply = s.respHExists(args)
 	case "HGETALL":
-		return s.respHGetAll(args)
+		reply = s.respHGetAll(args)
 	case "ZADD":
-		return s.respZAdd(args)
+		reply = s.respZAdd(args)
 	case "ZRANGE":
-		return s.respZRange(args)
+		reply = s.respZRange(args)
 	case "ZREM":
-		return s.respZRem(args)
+		reply = s.respZRem(args)
 	case "ZSCORE":
-		return s.respZScore(args)
+		reply = s.respZScore(args)
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
+	}
+
+	if writeCommands[cmd] {
+		s.propagate(v)
+	}
+
+	return reply
+}
+
+func (s *Server) propagate(v resp.Value) {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	if len(s.replicas) == 0 {
+		return
+	}
+	var buf strings.Builder
+	w := resp.NewWriter(&buf)
+	if err := w.Write(v); err != nil {
+		return
+	}
+	data := buf.String()
+	for conn := range s.replicas {
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write([]byte(data)); err != nil {
+			fmt.Printf("replica write error: %v\n", err)
+			conn.Close()
+			delete(s.replicas, conn)
+		}
+	}
+}
+
+func (s *Server) respReplicaOf(args []resp.Value) resp.Value {
+	if len(args) == 1 && strings.ToUpper(args[0].Str) == "NO" {
+		// REPLICAOF NO ONE — become master
+		s.replicaMu.Lock()
+		if s.masterConn != nil {
+			s.masterConn.Close()
+			s.masterConn = nil
+		}
+		s.isReplica = false
+		s.replicaMu.Unlock()
+		return resp.SimpleString("OK")
+	}
+	if len(args) != 2 {
+		return resp.Error("ERR wrong number of arguments for 'REPLICAOF' command")
+	}
+	host := args[0].Str
+	port := args[1].Str
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 5*time.Second)
+	if err != nil {
+		return resp.Error(fmt.Sprintf("ERR connecting to master: %v", err))
+	}
+
+	s.replicaMu.Lock()
+	if s.masterConn != nil {
+		s.masterConn.Close()
+	}
+	s.masterConn = conn
+	s.isReplica = true
+	s.replicaMu.Unlock()
+
+	go s.replicaReceiver(conn)
+	return resp.SimpleString("OK")
+}
+
+func (s *Server) replicaReceiver(conn net.Conn) {
+	defer conn.Close()
+	rd := resp.NewReader(conn)
+	for {
+		v, err := rd.Read()
+		if err != nil {
+			fmt.Printf("replica connection lost: %v\n", err)
+			s.replicaMu.Lock()
+			s.isReplica = false
+			s.masterConn = nil
+			s.replicaMu.Unlock()
+			return
+		}
+		s.executeCommand(v)
 	}
 }
 
