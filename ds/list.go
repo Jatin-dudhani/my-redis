@@ -14,6 +14,11 @@ func NewList() *List {
 func (l *List) LPush(vals ...string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// reverse to match Redis: LPUSH a b -> [b, a]
+	for i := 0; i < len(vals)/2; i++ {
+		j := len(vals) - 1 - i
+		vals[i], vals[j] = vals[j], vals[i]
+	}
 	l.items = append(vals, l.items...)
 	return len(l.items)
 }
