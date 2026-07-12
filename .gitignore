@@ -1,4 +1,9 @@
+# local docs (not for GitHub)
+plan.md
+understand.md
+
+# compiled binaries
+my-redis-server
 echoserver
 my-redis
 *.exe
-my-redis-server
