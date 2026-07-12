@@ -164,6 +164,57 @@ func TestExists(t *testing.T) {
 	}
 }
 
+func TestConcurrentClients(t *testing.T) {
+	s := startServer(t)
+	defer s.Stop()
+
+	start := make(chan struct{})
+	errs := make(chan error, 50)
+
+	for i := 0; i < 50; i++ {
+		go func(n int) {
+			<-start
+			conn, err := net.Dial("tcp", s.ln.Addr().String())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer conn.Close()
+
+			w := resp.NewWriter(conn)
+			r := resp.NewReader(conn)
+
+			// SET
+			key := resp.BulkString("SET")
+			arg1 := resp.BulkString("key")
+			arg2 := resp.BulkString("val")
+			w.Write(resp.Array([]resp.Value{key, arg1, arg2}))
+			reply, _ := r.Read()
+			if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
+				errs <- nil
+				return
+			}
+
+			// GET
+			w.Write(resp.Array([]resp.Value{resp.BulkString("GET"), resp.BulkString("key")}))
+			reply, _ = r.Read()
+			if reply.Typ != resp.TypeBulkString || reply.Str != "val" {
+				errs <- nil
+				return
+			}
+
+			errs <- nil
+		}(i)
+	}
+
+	close(start)
+	for i := 0; i < 50; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestProtocolError(t *testing.T) {
 	s := startServer(t)
 	defer s.Stop()
