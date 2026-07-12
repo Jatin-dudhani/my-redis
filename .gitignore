@@ -1,3 +1,4 @@
 echoserver
 my-redis
 *.exe
+my-redis-server
