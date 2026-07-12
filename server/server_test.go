@@ -33,6 +33,9 @@ func sendRESP(t *testing.T, conn net.Conn, v resp.Value) resp.Value {
 	if err := w.Write(v); err != nil {
 		t.Fatal(err)
 	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	r := resp.NewReader(conn)
 	reply, err := r.Read()
 	if err != nil {
@@ -189,6 +192,7 @@ func TestConcurrentClients(t *testing.T) {
 			arg1 := resp.BulkString("key")
 			arg2 := resp.BulkString("val")
 			w.Write(resp.Array([]resp.Value{key, arg1, arg2}))
+			w.Flush()
 			reply, _ := r.Read()
 			if reply.Typ != resp.TypeSimpleString || reply.Str != "OK" {
 				errs <- nil
@@ -197,6 +201,7 @@ func TestConcurrentClients(t *testing.T) {
 
 			// GET
 			w.Write(resp.Array([]resp.Value{resp.BulkString("GET"), resp.BulkString("key")}))
+			w.Flush()
 			reply, _ = r.Read()
 			if reply.Typ != resp.TypeBulkString || reply.Str != "val" {
 				errs <- nil

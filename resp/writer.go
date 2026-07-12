@@ -1,17 +1,26 @@
 package resp
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"strconv"
 )
 
 type Writer struct {
-	w io.Writer
+	w *bufio.Writer
 }
 
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: w}
+	return &Writer{w: bufio.NewWriter(w)}
+}
+
+func NewWriterSize(w io.Writer, size int) *Writer {
+	return &Writer{w: bufio.NewWriterSize(w, size)}
+}
+
+func (wr *Writer) Flush() error {
+	return wr.w.Flush()
 }
 
 func (wr *Writer) Write(v Value) error {

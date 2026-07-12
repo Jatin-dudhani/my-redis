@@ -6,14 +6,26 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 )
 
 type Reader struct {
 	rd *bufio.Reader
 }
 
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 1024)
+		return b
+	},
+}
+
 func NewReader(rd io.Reader) *Reader {
-	return &Reader{rd: bufio.NewReader(rd)}
+	return &Reader{rd: bufio.NewReaderSize(rd, 65536)}
+}
+
+func NewReaderSize(rd io.Reader, size int) *Reader {
+	return &Reader{rd: bufio.NewReaderSize(rd, size)}
 }
 
 func (r *Reader) Read() (Value, error) {
@@ -88,16 +100,24 @@ func (r *Reader) readBulkString() (Value, error) {
 	if err != nil {
 		return Value{}, fmt.Errorf("invalid bulk string length: %s", line)
 	}
-	buf := make([]byte, n)
+	buf := bufPool.Get().([]byte)
+	if cap(buf) < n {
+		buf = make([]byte, n)
+	}
+	buf = buf[:n]
 	_, err = io.ReadFull(r.rd, buf)
 	if err != nil {
+		bufPool.Put(buf[:0])
 		return Value{}, err
 	}
-	_, err = r.readLine() // consume trailing \r\n
+	_, err = r.readLine()
 	if err != nil {
+		bufPool.Put(buf[:0])
 		return Value{}, err
 	}
-	return Value{Typ: TypeBulkString, Str: string(buf)}, nil
+	s := string(buf)
+	bufPool.Put(buf[:0])
+	return Value{Typ: TypeBulkString, Str: s}, nil
 }
 
 func (r *Reader) readArray() (Value, error) {

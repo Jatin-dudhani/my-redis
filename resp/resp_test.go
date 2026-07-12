@@ -12,6 +12,9 @@ func roundTrip(t *testing.T, v Value, expectedWire string) {
 	if err := w.Write(v); err != nil {
 		t.Fatal(err)
 	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if buf.String() != expectedWire {
 		t.Fatalf("wire: expected %q, got %q", expectedWire, buf.String())
 	}
@@ -69,6 +72,9 @@ func TestNestedArray(t *testing.T) {
 	if err := w.Write(v); err != nil {
 		t.Fatal(err)
 	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	r := NewReader(&buf)
 	parsed, err := r.Read()
 	if err != nil {
@@ -123,6 +129,9 @@ func TestRoundTripComplex(t *testing.T) {
 	if err := w.Write(original); err != nil {
 		t.Fatal(err)
 	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	r := NewReader(&buf)
 	parsed, err := r.Read()
 	if err != nil {
@@ -149,6 +158,9 @@ func TestNullBulkStringInArray(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
 	if err := w.Write(v); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	r := NewReader(&buf)
