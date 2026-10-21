@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Jatin-dudhani/my-redis/acl"
 	"github.com/Jatin-dudhani/my-redis/aof"
@@ -160,7 +161,11 @@ func (s *Server) EnableHTTPTelemetry(httpAddr string) error {
 			return list
 		},
 		ExecuteCommand: func(cmdStr string) string {
-			parts := strings.Fields(cmdStr)
+			cmdStr = strings.TrimSpace(cmdStr)
+			if cmdStr == "" {
+				return ""
+			}
+			parts := splitCommandLine(cmdStr)
 			if len(parts) == 0 {
 				return ""
 			}
@@ -169,22 +174,7 @@ func (s *Server) EnableHTTPTelemetry(httpAddr string) error {
 				vals = append(vals, resp.BulkString(p))
 			}
 			res := s.executeCommand(resp.Array(vals))
-			switch res.Typ {
-			case resp.TypeSimpleString, resp.TypeBulkString, resp.TypeError:
-				return res.Str
-			case resp.TypeInteger:
-				return strconv.FormatInt(res.Num, 10)
-			case resp.TypeNull:
-				return "(nil)"
-			case resp.TypeArray:
-				var sb strings.Builder
-				for i, item := range res.Array {
-					sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, item.Str))
-				}
-				return sb.String()
-			default:
-				return "OK"
-			}
+			return formatRESPValue(res, 0)
 		},
 	}
 	s.httpSrv = telemetry.NewHTTPServer(httpAddr, s.metrics, callbacks)
@@ -196,6 +186,10 @@ func (s *Server) EnableHTTPTelemetry(httpAddr string) error {
 
 func (s *Server) Metrics() *telemetry.Metrics {
 	return s.metrics
+}
+
+func (s *Server) HTTPServer() *telemetry.HTTPServer {
+	return s.httpSrv
 }
 
 func (s *Server) ACL() *acl.Manager {
@@ -271,6 +265,11 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen on %s: %w", s.addr, err)
 	}
 	s.ln = ln
+	if s.store == nil {
+		s.store = store.New()
+	}
+	s.store.StartCleanup(100 * time.Millisecond)
+
 	select {
 	case <-s.ready:
 	default:
@@ -278,10 +277,6 @@ func (s *Server) Start() error {
 	}
 
 	fmt.Printf("server listening on %s\n", s.addr)
-	if s.store == nil {
-		s.store = store.New()
-	}
-	s.store.StartCleanup(100 * time.Millisecond)
 
 	for {
 		conn, err := ln.Accept()
@@ -631,6 +626,8 @@ func (s *Server) enterSubscribeMode(v resp.Value, cs *clientState, wr *resp.Writ
 
 var writeCommands = map[string]bool{
 	"SET": true, "DEL": true, "EXPIRE": true,
+	"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true,
+	"MSET": true,
 	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true,
 	"SADD": true, "SREM": true,
 	"HSET": true, "HDEL": true,
@@ -668,6 +665,18 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 		reply = s.respSet(args)
 	case "GET":
 		reply = s.respGet(args)
+	case "MSET":
+		reply = s.respMSet(args)
+	case "MGET":
+		reply = s.respMGet(args)
+	case "INCR":
+		reply = s.respIncr(args)
+	case "DECR":
+		reply = s.respDecr(args)
+	case "INCRBY":
+		reply = s.respIncrBy(args)
+	case "DECRBY":
+		reply = s.respDecrBy(args)
 	case "DEL":
 		reply = s.respDel(args)
 	case "EXISTS":
@@ -998,6 +1007,102 @@ func (s *Server) respGet(args []resp.Value) resp.Value {
 	return resp.BulkString(str)
 }
 
+func (s *Server) respIncr(args []resp.Value) resp.Value {
+	return s.incrBy(args, 1)
+}
+
+func (s *Server) respDecr(args []resp.Value) resp.Value {
+	return s.incrBy(args, -1)
+}
+
+func (s *Server) respIncrBy(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.Error("ERR wrong number of arguments for 'INCRBY' command")
+	}
+	delta, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	return s.incrBy([]resp.Value{args[0]}, delta)
+}
+
+func (s *Server) respDecrBy(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return resp.Error("ERR wrong number of arguments for 'DECRBY' command")
+	}
+	delta, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.Error("ERR value is not an integer or out of range")
+	}
+	return s.incrBy([]resp.Value{args[0]}, -delta)
+}
+
+func (s *Server) incrBy(args []resp.Value, delta int64) resp.Value {
+	if len(args) != 1 {
+		return resp.Error("ERR wrong number of arguments for increment command")
+	}
+	key := args[0].Str
+	val, ok := s.store.Get(key)
+	var current int64
+	if ok {
+		if s.metrics != nil {
+			s.metrics.RecordHit()
+		}
+		str, isStr := val.(string)
+		if !isStr {
+			return resp.Error("WRONGTYPE Operation against a key holding the wrong kind of value")
+		}
+		var err error
+		current, err = strconv.ParseInt(str, 10, 64)
+		if err != nil {
+			return resp.Error("ERR value is not an integer or out of range")
+		}
+	} else {
+		if s.metrics != nil {
+			s.metrics.RecordMiss()
+		}
+	}
+	current += delta
+	s.store.Set(key, strconv.FormatInt(current, 10))
+	s.touchWatchedKey(key)
+	return resp.Integer(current)
+}
+
+func (s *Server) respMGet(args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return resp.Error("ERR wrong number of arguments for 'MGET' command")
+	}
+	var res []resp.Value
+	for _, arg := range args {
+		val, ok := s.store.Get(arg.Str)
+		if !ok || val == nil {
+			if s.metrics != nil {
+				s.metrics.RecordMiss()
+			}
+			res = append(res, resp.Null())
+		} else if str, isStr := val.(string); isStr {
+			if s.metrics != nil {
+				s.metrics.RecordHit()
+			}
+			res = append(res, resp.BulkString(str))
+		} else {
+			res = append(res, resp.Null())
+		}
+	}
+	return resp.Array(res)
+}
+
+func (s *Server) respMSet(args []resp.Value) resp.Value {
+	if len(args) < 2 || len(args)%2 != 0 {
+		return resp.Error("ERR wrong number of arguments for 'MSET' command")
+	}
+	for i := 0; i < len(args); i += 2 {
+		s.store.Set(args[i].Str, args[i+1].Str)
+		s.touchWatchedKey(args[i].Str)
+	}
+	return resp.SimpleString("OK")
+}
+
 func (s *Server) respDel(args []resp.Value) resp.Value {
 	if len(args) < 1 {
 		return resp.Error("ERR wrong number of arguments for 'DEL' command")
@@ -1067,4 +1172,94 @@ func removeStr(slice []string, s string) []string {
 		}
 	}
 	return slice
+}
+
+// splitCommandLine tokenizes a command string supporting quotes (single and double) and backslash escaping.
+func splitCommandLine(s string) []string {
+	var args []string
+	var current strings.Builder
+	inQuotes := false
+	quoteChar := byte(0)
+	escaped := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			current.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if inQuotes {
+			if c == quoteChar {
+				inQuotes = false
+			} else {
+				current.WriteByte(c)
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inQuotes = true
+			quoteChar = c
+			continue
+		}
+		if unicode.IsSpace(rune(c)) {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+		current.WriteByte(c)
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args
+}
+
+// formatRESPValue renders RESP values into readable redis-cli style output.
+func formatRESPValue(v resp.Value, indent int) string {
+	prefix := strings.Repeat("  ", indent)
+	switch v.Typ {
+	case resp.TypeSimpleString:
+		return prefix + v.Str
+	case resp.TypeBulkString:
+		if strings.Contains(v.Str, "\n") {
+			return prefix + v.Str
+		}
+		return prefix + "\"" + v.Str + "\""
+	case resp.TypeError:
+		return prefix + "(error) " + v.Str
+	case resp.TypeInteger:
+		return fmt.Sprintf("%s(integer) %d", prefix, v.Num)
+	case resp.TypeNull:
+		return prefix + "(nil)"
+	case resp.TypeArray:
+		if len(v.Array) == 0 {
+			return prefix + "(empty array)"
+		}
+		var sb strings.Builder
+		for i, item := range v.Array {
+			var itemFormatted string
+			if item.Typ == resp.TypeArray {
+				itemFormatted = "\n" + formatRESPValue(item, indent+1)
+			} else {
+				itemFormatted = formatRESPValue(item, 0)
+			}
+			sb.WriteString(fmt.Sprintf("%s%d) %s", prefix, i+1, itemFormatted))
+			if i < len(v.Array)-1 {
+				sb.WriteString("\n")
+			}
+		}
+		return sb.String()
+	default:
+		if v.Str != "" {
+			return prefix + v.Str
+		}
+		return prefix + "OK"
+	}
 }

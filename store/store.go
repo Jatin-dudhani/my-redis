@@ -26,6 +26,7 @@ type Store struct {
 	shards    [numShards]*shard
 	maxKeys   int64
 	totalKeys int64
+	cleanupMu sync.Mutex
 	stopCh    chan struct{}
 	rnd       *rand.Rand
 	rndMu     sync.Mutex
@@ -129,7 +130,18 @@ func (sh *shard) touchLocked(key string) {
 }
 
 func (s *Store) StartCleanup(interval time.Duration) {
-	s.stopCh = make(chan struct{})
+	s.cleanupMu.Lock()
+	if s.stopCh != nil {
+		select {
+		case <-s.stopCh:
+		default:
+			close(s.stopCh)
+		}
+	}
+	stopCh := make(chan struct{})
+	s.stopCh = stopCh
+	s.cleanupMu.Unlock()
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -137,7 +149,7 @@ func (s *Store) StartCleanup(interval time.Duration) {
 			select {
 			case <-ticker.C:
 				s.activeExpireCycle()
-			case <-s.stopCh:
+			case <-stopCh:
 				return
 			}
 		}
@@ -145,6 +157,8 @@ func (s *Store) StartCleanup(interval time.Duration) {
 }
 
 func (s *Store) StopCleanup() {
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
 	if s.stopCh != nil {
 		select {
 		case <-s.stopCh:

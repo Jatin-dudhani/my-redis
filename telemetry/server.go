@@ -43,12 +43,24 @@ func NewHTTPServer(addr string, metrics *Metrics, callbacks ServerCallbacks) *HT
 	}
 }
 
+func setCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+}
+
 // Start begins listening and serving HTTP requests.
 func (h *HTTPServer) Start() error {
 	mux := http.NewServeMux()
 
 	// 1. Prometheus /metrics endpoint
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		clients := 0
 		keys := 0
 		if h.callbacks.GetClientsCount != nil {
@@ -77,6 +89,12 @@ func (h *HTTPServer) Start() error {
 
 	// 3. JSON API: /api/stats
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		snap := h.metrics.Snapshot()
 		clients := 0
 		keys := 0
@@ -106,6 +124,12 @@ func (h *HTTPServer) Start() error {
 
 	// 4. JSON API: /api/keys
 	mux.HandleFunc("/api/keys", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		var list []KeyInfo
 		if h.callbacks.GetKeysInfo != nil {
 			list = h.callbacks.GetKeysInfo()
@@ -120,6 +144,12 @@ func (h *HTTPServer) Start() error {
 
 	// 5. JSON API: /api/query
 	mux.HandleFunc("/api/query", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -160,6 +190,16 @@ func (h *HTTPServer) Start() error {
 	h.mu.Unlock()
 
 	return srv.Serve(ln)
+}
+
+// Addr returns the bound network address of the HTTP server.
+func (h *HTTPServer) Addr() net.Addr {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ln != nil {
+		return h.ln.Addr()
+	}
+	return nil
 }
 
 // Stop gracefully stops the HTTP telemetry service.

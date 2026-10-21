@@ -181,10 +181,58 @@ const DashboardHTML = `<!DOCTYPE html>
       background: #060911;
       font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
       font-size: 0.88rem;
-      height: 280px;
+      height: 300px;
       overflow-y: auto;
       color: #38bdf8;
       line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .term-line-cmd {
+      color: #94a3b8;
+      font-weight: 600;
+    }
+    .term-line-out {
+      color: #38bdf8;
+    }
+    .term-line-err {
+      color: #f43f5e;
+      font-weight: 600;
+    }
+    .quick-cmds {
+      display: flex;
+      gap: 0.4rem;
+      padding: 0.5rem 1rem;
+      background: #0b0f19;
+      border-top: 1px solid var(--card-border);
+      overflow-x: auto;
+    }
+    .cmd-chip {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #cbd5e1;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-family: monospace;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+      user-select: none;
+    }
+    .cmd-chip:hover {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: #38bdf8;
+      color: #38bdf8;
+    }
+    .cmd-chip.chip-clear {
+      margin-left: auto;
+      color: #f87171;
+    }
+    .cmd-chip.chip-clear:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: #ef4444;
+      color: #ef4444;
     }
     .terminal-input-bar {
       display: flex;
@@ -303,14 +351,22 @@ const DashboardHTML = `<!DOCTYPE html>
       <div class="panel">
         <div class="panel-header">
           <div class="panel-title">Interactive Terminal Console</div>
-          <span style="font-size: 0.75rem; color: var(--text-muted);">Execute RESP Commands</span>
+          <span style="font-size: 0.75rem; color: var(--text-muted);">Real-Time RESP Shell</span>
         </div>
         <div class="terminal-output" id="term-out">
           &gt; Welcome to My-Redis Interactive Web Shell.<br>
           &gt; Type any Redis command (e.g. PING, SET foo bar, GET foo, INFO, GEOADD, PFADD, EVAL).<br>
         </div>
+        <div class="quick-cmds">
+          <span class="cmd-chip" onclick="quickRun('PING')">PING</span>
+          <span class="cmd-chip" onclick="quickRun('INFO')">INFO</span>
+          <span class="cmd-chip" onclick="quickRun('KEYS *')">KEYS *</span>
+          <span class="cmd-chip" onclick="quickRun('DBSIZE')">DBSIZE</span>
+          <span class="cmd-chip" onclick="quickRun('CLUSTER NODES')">CLUSTER NODES</span>
+          <span class="cmd-chip chip-clear" onclick="clearTerm()">Clear</span>
+        </div>
         <div class="terminal-input-bar">
-          <input type="text" id="term-in" placeholder="PING" autocomplete="off" />
+          <input type="text" id="term-in" placeholder="PING" autocomplete="off" spellcheck="false" />
           <button id="term-btn" onclick="runCommand()">Execute</button>
         </div>
       </div>
@@ -386,14 +442,36 @@ const DashboardHTML = `<!DOCTYPE html>
       }
     }
 
+    let cmdHistory = [];
+    let historyIndex = -1;
+
+    function quickRun(cmd) {
+      const input = document.getElementById('term-in');
+      input.value = cmd;
+      runCommand();
+    }
+
+    function clearTerm() {
+      const term = document.getElementById('term-out');
+      term.innerHTML = '&gt; Terminal cleared.<br>';
+    }
+
     async function runCommand() {
       const input = document.getElementById('term-in');
+      const btn = document.getElementById('term-btn');
       const cmd = input.value.trim();
       if (!cmd) return;
+
+      cmdHistory.push(cmd);
+      historyIndex = cmdHistory.length;
       input.value = '';
 
       const term = document.getElementById('term-out');
-      term.innerHTML += '<br><span style="color: #94a3b8;">&gt; ' + escapeHtml(cmd) + '</span><br>';
+      term.innerHTML += '<br><span class="term-line-cmd">&gt; ' + escapeHtml(cmd) + '</span><br>';
+      term.scrollTop = term.scrollHeight;
+
+      btn.disabled = true;
+      btn.innerText = '...';
 
       try {
         const res = await fetch('/api/query', {
@@ -401,18 +479,45 @@ const DashboardHTML = `<!DOCTYPE html>
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({command: cmd})
         });
-        const out = await res.json();
-        term.innerHTML += '<span style="color: #38bdf8;">' + escapeHtml(out.reply) + '</span><br>';
+        if (!res.ok) {
+          const txt = await res.text();
+          term.innerHTML += '<span class="term-line-err">(error) HTTP ' + res.status + ': ' + escapeHtml(txt) + '</span><br>';
+        } else {
+          const out = await res.json();
+          term.innerHTML += '<span class="term-line-out">' + escapeHtml(out.reply) + '</span><br>';
+        }
       } catch (e) {
-        term.innerHTML += '<span style="color: #f43f5e;">ERR ' + escapeHtml(e.message) + '</span><br>';
+        term.innerHTML += '<span class="term-line-err">(error) ' + escapeHtml(e.message) + '</span><br>';
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Execute';
+        term.scrollTop = term.scrollHeight;
+        input.focus();
+        fetchStats();
+        fetchKeys();
       }
-      term.scrollTop = term.scrollHeight;
-      fetchStats();
-      fetchKeys();
     }
 
     document.getElementById('term-in').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') runCommand();
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        runCommand();
+      } else if (e.key === 'ArrowUp') {
+        if (cmdHistory.length > 0 && historyIndex > 0) {
+          historyIndex--;
+          e.target.value = cmdHistory[historyIndex];
+          e.preventDefault();
+        }
+      } else if (e.key === 'ArrowDown') {
+        if (historyIndex < cmdHistory.length - 1) {
+          historyIndex++;
+          e.target.value = cmdHistory[historyIndex];
+          e.preventDefault();
+        } else {
+          historyIndex = cmdHistory.length;
+          e.target.value = '';
+        }
+      }
     });
 
     function escapeHtml(str) {

@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -487,6 +490,127 @@ func TestClusterGossipMeetOverTCP(t *testing.T) {
 	rInfo := sendCmd(c1, "CLUSTER", "INFO")
 	if !strings.Contains(rInfo.Str, "cluster_known_nodes:2") {
 		t.Fatalf("expected cluster_known_nodes:2 in info, got %s", rInfo.Str)
+	}
+}
+
+func TestInteractiveConsoleAndRESPFormatting(t *testing.T) {
+	// 1. Verify splitCommandLine
+	cmd := `SET user:1 "John \"Super\" Doe" EX 3600`
+	parts := splitCommandLine(cmd)
+	expected := []string{"SET", "user:1", `John "Super" Doe`, "EX", "3600"}
+	if len(parts) != len(expected) {
+		t.Fatalf("expected %d parts, got %d: %v", len(expected), len(parts), parts)
+	}
+	for i := range parts {
+		if parts[i] != expected[i] {
+			t.Errorf("part %d: expected %q, got %q", i, expected[i], parts[i])
+		}
+	}
+
+	// 2. Verify formatRESPValue
+	vInt := resp.Integer(42)
+	if formatRESPValue(vInt, 0) != "(integer) 42" {
+		t.Errorf("unexpected integer format: %s", formatRESPValue(vInt, 0))
+	}
+
+	vNil := resp.Null()
+	if formatRESPValue(vNil, 0) != "(nil)" {
+		t.Errorf("unexpected nil format: %s", formatRESPValue(vNil, 0))
+	}
+
+	vErr := resp.Error("ERR custom error")
+	if formatRESPValue(vErr, 0) != "(error) ERR custom error" {
+		t.Errorf("unexpected error format: %s", formatRESPValue(vErr, 0))
+	}
+
+	vArr := resp.Array([]resp.Value{
+		resp.BulkString("key1"),
+		resp.Integer(100),
+		resp.Null(),
+	})
+	formattedArr := formatRESPValue(vArr, 0)
+	expectedArr := "1) \"key1\"\n2) (integer) 100\n3) (nil)"
+	if formattedArr != expectedArr {
+		t.Errorf("unexpected array format:\n%s\nvs expected:\n%s", formattedArr, expectedArr)
+	}
+
+	// 3. Test HTTP Telemetry Console API
+	s := New(":0", "")
+	defer s.Stop()
+
+	go s.Start()
+	s.WaitReady()
+
+	err := s.EnableHTTPTelemetry("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("EnableHTTPTelemetry failed: %v", err)
+	}
+
+	// Wait for HTTP server to bind
+	var httpAddr net.Addr
+	for i := 0; i < 50; i++ {
+		if s.HTTPServer() != nil && s.HTTPServer().Addr() != nil {
+			httpAddr = s.HTTPServer().Addr()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if httpAddr == nil {
+		t.Fatal("http server failed to bind")
+	}
+
+	baseURL := fmt.Sprintf("http://%s", httpAddr.String())
+
+	// Test CORS Preflight OPTIONS
+	req, _ := http.NewRequest(http.MethodOptions, baseURL+"/api/query", nil)
+	respHttp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("OPTIONS request failed: %v", err)
+	}
+	if respHttp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on OPTIONS, got %d", respHttp.StatusCode)
+	}
+	if respHttp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("missing Access-Control-Allow-Origin header")
+	}
+
+	// Test Command Execution via POST /api/query
+	queryCmd := func(command string) string {
+		body, _ := json.Marshal(map[string]string{"command": command})
+		res, err := http.Post(baseURL+"/api/query", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("post /api/query failed: %v", err)
+		}
+		defer res.Body.Close()
+		var out struct {
+			Reply string `json:"reply"`
+		}
+		_ = json.NewDecoder(res.Body).Decode(&out)
+		return out.Reply
+	}
+
+	// SET with quoted spaces
+	setReply := queryCmd(`SET greeting "Hello, Redis World!"`)
+	if setReply != "OK" {
+		t.Fatalf("expected OK, got %q", setReply)
+	}
+
+	// GET returning quoted bulk string
+	getReply := queryCmd(`GET greeting`)
+	if getReply != `"Hello, Redis World!"` {
+		t.Fatalf("expected \"Hello, Redis World!\", got %q", getReply)
+	}
+
+	// INCR returning integer format
+	incrReply := queryCmd(`INCR hits`)
+	if incrReply != "(integer) 1" {
+		t.Fatalf("expected (integer) 1, got %q", incrReply)
+	}
+
+	// KEYS returning array format
+	keysReply := queryCmd(`KEYS *`)
+	if !strings.Contains(keysReply, "greeting") || !strings.Contains(keysReply, "hits") {
+		t.Fatalf("expected keys in output, got: %s", keysReply)
 	}
 }
 
