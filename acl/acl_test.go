@@ -59,6 +59,15 @@ func TestACLSetUserAndPassword(t *testing.T) {
 	if ok {
 		t.Fatalf("expected SET to be forbidden")
 	}
+
+	// Test pre-hashed token rule
+	_ = m.SetUser("charlie", []string{"on", "#myPrecomputedToken123", "+@all", "~*"})
+	if !m.Authenticate("charlie", "myPrecomputedToken123") {
+		t.Fatalf("expected pre-hashed token to authenticate successfully")
+	}
+	if m.Authenticate("charlie", "badToken") {
+		t.Fatalf("expected bad token to fail authentication")
+	}
 }
 
 func TestACLDelUser(t *testing.T) {

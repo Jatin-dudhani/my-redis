@@ -1,14 +1,14 @@
 package acl
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Categories of Redis commands
@@ -42,7 +42,7 @@ type User struct {
 	Username    string
 	Enabled     bool
 	NoPass      bool
-	Passwords   map[string]bool // SHA-256 hex hashed passwords
+	Passwords   map[string]bool // hashed passwords (bcrypt or pre-hashed token)
 	AllCommands bool
 	AllowedCmds map[string]bool
 	DeniedCmds  map[string]bool
@@ -56,10 +56,13 @@ type Manager struct {
 	users map[string]*User
 }
 
-// HashPassword computes SHA-256 digest of cleartext password.
+// HashPassword computes a secure salted bcrypt hash of a cleartext password.
 func HashPassword(pwd string) string {
-	h := sha256.Sum256([]byte(pwd))
-	return hex.EncodeToString(h[:])
+	b, err := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // NewManager initializes the ACL manager with a permissive default user.
@@ -120,8 +123,8 @@ func (m *Manager) SetUser(username string, rules []string) error {
 			u.Passwords[hash] = true
 			u.NoPass = false
 		case strings.HasPrefix(rule, "#"):
-			// Pre-hashed password
-			hash := strings.ToLower(rule[1:])
+			// Pre-hashed password token or hash
+			hash := rule[1:]
 			u.Passwords[hash] = true
 			u.NoPass = false
 		case rule == "+@all":
@@ -186,9 +189,13 @@ func (m *Manager) Authenticate(username, password string) bool {
 		return true
 	}
 
-	candidateHash := HashPassword(password)
 	for storedHash := range u.Passwords {
-		if subtle.ConstantTimeCompare([]byte(candidateHash), []byte(storedHash)) == 1 {
+		// 1. Verify salted bcrypt hash
+		if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)); err == nil {
+			return true
+		}
+		// 2. Constant-time fallback for pre-hashed tokens
+		if subtle.ConstantTimeCompare([]byte(storedHash), []byte(password)) == 1 {
 			return true
 		}
 	}
