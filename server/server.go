@@ -10,11 +10,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Jatin-dudhani/my-redis/acl"
 	"github.com/Jatin-dudhani/my-redis/aof"
 	"github.com/Jatin-dudhani/my-redis/cluster"
+	"github.com/Jatin-dudhani/my-redis/ds"
+	"github.com/Jatin-dudhani/my-redis/lua"
 	"github.com/Jatin-dudhani/my-redis/pubsub"
 	"github.com/Jatin-dudhani/my-redis/resp"
 	"github.com/Jatin-dudhani/my-redis/store"
+	"github.com/Jatin-dudhani/my-redis/telemetry"
 )
 
 type Server struct {
@@ -27,7 +31,12 @@ type Server struct {
 	store     *store.Store
 	pubsub    *pubsub.Hub
 	cluster   *cluster.Cluster
+	gossipBus *cluster.GossipBus
 	startTime time.Time
+	acl       *acl.Manager
+	luaEngine *lua.Engine
+	metrics   *telemetry.Metrics
+	httpSrv   *telemetry.HTTPServer
 
 	execMu    sync.Mutex
 	clientsMu sync.RWMutex
@@ -43,15 +52,16 @@ type Server struct {
 }
 
 type clientState struct {
-	inTx        bool
-	queue       []resp.Value
-	mu          sync.Mutex
-	subscribed  bool
-	sub         *pubsub.Subscriber
-	channels    []string
-	isReplica   bool
-	watchedKeys map[string]struct{}
-	txDirty     bool
+	inTx              bool
+	queue             []resp.Value
+	mu                sync.Mutex
+	subscribed        bool
+	sub               *pubsub.Subscriber
+	channels          []string
+	isReplica         bool
+	watchedKeys       map[string]struct{}
+	txDirty           bool
+	authenticatedUser string
 }
 
 func New(addr, dbPath string) *Server {
@@ -65,6 +75,9 @@ func New(addr, dbPath string) *Server {
 		clients:   make(map[*clientState]struct{}),
 		waiters:   make(map[string][]chan string),
 		startTime: time.Now(),
+		acl:       acl.NewManager(),
+		luaEngine: lua.NewEngine(),
+		metrics:   telemetry.NewMetrics(),
 	}
 	s.loadDB()
 	return s
@@ -90,6 +103,111 @@ func (s *Server) EnableAOF(path string, policy aof.FsyncPolicy) error {
 
 func (s *Server) EnableCluster(nodeID string, startSlot, endSlot uint16) {
 	s.cluster = cluster.NewCluster(nodeID, s.addr, startSlot, endSlot)
+}
+
+func (s *Server) EnableClusterBus(busAddr string) error {
+	if s.cluster == nil {
+		s.EnableCluster("node-main", 0, 16383)
+	}
+	s.gossipBus = cluster.NewGossipBus(s.cluster, s.cluster.NodeID(), s.addr, busAddr)
+	return s.gossipBus.Start()
+}
+
+func (s *Server) EnableHTTPTelemetry(httpAddr string) error {
+	callbacks := telemetry.ServerCallbacks{
+		GetClientsCount: func() int {
+			s.clientsMu.RLock()
+			defer s.clientsMu.RUnlock()
+			return len(s.clients)
+		},
+		GetKeysCount: func() int {
+			return s.store.Len()
+		},
+		GetKeysInfo: func() []telemetry.KeyInfo {
+			dumps := s.store.DumpAll()
+			var list []telemetry.KeyInfo
+			for _, d := range dumps {
+				typ := "unknown"
+				switch d.Value.(type) {
+				case string:
+					typ = "string"
+				case *ds.List:
+					typ = "list"
+				case *ds.Set:
+					typ = "set"
+				case *ds.Hash:
+					typ = "hash"
+				case *ds.SSet:
+					typ = "zset"
+				case *ds.Stream:
+					typ = "stream"
+				case *ds.HLL:
+					typ = "hll"
+				}
+				ttl := int64(-1)
+				if d.ExpiresAt != nil {
+					rem := time.Until(*d.ExpiresAt)
+					if rem > 0 {
+						ttl = int64(rem.Seconds())
+					}
+				}
+				list = append(list, telemetry.KeyInfo{
+					Key:  d.Key,
+					Type: typ,
+					TTL:  ttl,
+				})
+			}
+			return list
+		},
+		ExecuteCommand: func(cmdStr string) string {
+			parts := strings.Fields(cmdStr)
+			if len(parts) == 0 {
+				return ""
+			}
+			var vals []resp.Value
+			for _, p := range parts {
+				vals = append(vals, resp.BulkString(p))
+			}
+			res := s.executeCommand(resp.Array(vals))
+			switch res.Typ {
+			case resp.TypeSimpleString, resp.TypeBulkString, resp.TypeError:
+				return res.Str
+			case resp.TypeInteger:
+				return strconv.FormatInt(res.Num, 10)
+			case resp.TypeNull:
+				return "(nil)"
+			case resp.TypeArray:
+				var sb strings.Builder
+				for i, item := range res.Array {
+					sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, item.Str))
+				}
+				return sb.String()
+			default:
+				return "OK"
+			}
+		},
+	}
+	s.httpSrv = telemetry.NewHTTPServer(httpAddr, s.metrics, callbacks)
+	go func() {
+		_ = s.httpSrv.Start()
+	}()
+	return nil
+}
+
+func (s *Server) Metrics() *telemetry.Metrics {
+	return s.metrics
+}
+
+func (s *Server) ACL() *acl.Manager {
+	return s.acl
+}
+
+func (s *Server) LuaEngine() *lua.Engine {
+	return s.luaEngine
+}
+
+func (s *Server) GossipBus() *cluster.GossipBus {
+	return s.gossipBus
 }
 
 func (s *Server) Cluster() *cluster.Cluster {
@@ -182,6 +300,15 @@ func (s *Server) Stop() error {
 	s.store.StopCleanup()
 	if s.aof != nil {
 		_ = s.aof.Close()
+	}
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Stop()
+	}
+	if s.gossipBus != nil {
+		s.gossipBus.Stop()
+	}
+	if s.metrics != nil {
+		s.metrics.Close()
 	}
 	if s.ln != nil {
 		return s.ln.Close()
@@ -370,6 +497,28 @@ func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 	}
 	cmd := strings.ToUpper(v.Array[0].Str)
 
+	// Authentication & ACL checking
+	if s.acl != nil {
+		cs.mu.Lock()
+		user := cs.authenticatedUser
+		if user == "" {
+			user = "default"
+		}
+		cs.mu.Unlock()
+
+		if cmd == "AUTH" {
+			return s.handleAuth(v.Array[1:], cs)
+		}
+
+		firstKey := ""
+		if len(v.Array) > 1 {
+			firstKey = v.Array[1].Str
+		}
+		if ok, reason := s.acl.CheckPermission(user, cmd, firstKey); !ok {
+			return resp.Error(reason)
+		}
+	}
+
 	if cmd == "WATCH" {
 		if len(v.Array) < 2 {
 			return resp.Error("ERR wrong number of arguments for 'WATCH' command")
@@ -487,11 +636,18 @@ var writeCommands = map[string]bool{
 	"HSET": true, "HDEL": true,
 	"ZADD": true, "ZREM": true,
 	"XADD": true, "FLUSHDB": true,
+	"SETBIT": true, "BITOP": true,
+	"PFADD": true, "PFMERGE": true,
+	"GEOADD": true,
 }
 
 func (s *Server) executeCommand(v resp.Value) resp.Value {
 	cmd := strings.ToUpper(v.Array[0].Str)
 	args := v.Array[1:]
+
+	if s.metrics != nil {
+		s.metrics.RecordCommand(cmd)
+	}
 
 	// Cluster redirection check if enabled
 	if s.cluster != nil && len(args) > 0 {
@@ -592,6 +748,69 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 		reply = s.respInfo(args)
 	case "CLUSTER":
 		reply = s.respCluster(args)
+
+	// Bitmaps
+	case "SETBIT":
+		reply = s.respSetBit(args)
+	case "GETBIT":
+		reply = s.respGetBit(args)
+	case "BITCOUNT":
+		reply = s.respBitCount(args)
+	case "BITPOS":
+		reply = s.respBitPos(args)
+	case "BITOP":
+		reply = s.respBitOp(args)
+
+	// HyperLogLog
+	case "PFADD":
+		reply = s.respPFAdd(args)
+	case "PFCOUNT":
+		reply = s.respPFCount(args)
+	case "PFMERGE":
+		reply = s.respPFMerge(args)
+
+	// Geospatial
+	case "GEOADD":
+		reply = s.respGeoAdd(args)
+	case "GEOPOS":
+		reply = s.respGeoPos(args)
+	case "GEODIST":
+		reply = s.respGeoDist(args)
+	case "GEOSEARCH":
+		reply = s.respGeoSearch(args)
+	case "GEORADIUS":
+		reply = s.respGeoRadius(args)
+	case "GEOHASH":
+		reply = s.respGeoHash(args)
+
+	// Lua Scripting
+	case "EVAL":
+		reply = s.respEval(args)
+	case "EVALSHA":
+		reply = s.respEvalSHA(args)
+	case "SCRIPT":
+		reply = s.respScript(args)
+
+	// Enterprise ACL & Auth
+	case "ACL":
+		reply = s.respACL(args)
+	case "AUTH":
+		if len(args) == 0 {
+			reply = resp.Error("ERR wrong number of arguments for 'AUTH' command")
+		} else {
+			u := "default"
+			p := args[0].Str
+			if len(args) >= 2 {
+				u = args[0].Str
+				p = args[1].Str
+			}
+			if s.acl != nil && s.acl.Authenticate(u, p) {
+				reply = resp.SimpleString("OK")
+			} else {
+				reply = resp.Error("WRONGPASS invalid username-password pair or user is disabled.")
+			}
+		}
+
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
@@ -763,12 +982,18 @@ func (s *Server) respGet(args []resp.Value) resp.Value {
 		return resp.Error("ERR wrong number of arguments for 'GET' command")
 	}
 	val, ok := s.store.Get(args[0].Str)
-	if !ok {
+	if !ok || val == nil {
+		if s.metrics != nil {
+			s.metrics.RecordMiss()
+		}
 		return resp.Null()
 	}
 	str, ok := val.(string)
 	if !ok {
 		return resp.Error("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	if s.metrics != nil {
+		s.metrics.RecordHit()
 	}
 	return resp.BulkString(str)
 }

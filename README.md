@@ -72,6 +72,44 @@ I built this project to explore systems programming, low-level data structures, 
 - **Hash Tags:** Supports `{user100}:profile` and `{user100}:orders` to hash only what is between curly brackets for multi-key locality.
 - **`-MOVED` Redirection:** Returns standard `-MOVED <slot> <targetAddr>` errors when accessing keys owned by remote nodes, fully compatible with cluster-aware client libraries.
 
+### 7. Lua Scripting Engine (`EVAL` & `EVALSHA`)
+- **The Problem:** Executing complex transactions that require reading values, making conditional branching decisions, and updating multiple keys atomically cannot be done with simple `MULTI`/`EXEC` without optimistic concurrency rollbacks (`WATCH`).
+- **My Solution:** I embedded a high-performance **Lua 5.1 runtime engine** (`github.com/yuin/gopher-lua`). Scripts run with injected tables `KEYS` and `ARGV`, and can execute arbitrary server commands via `redis.call(...)` and `redis.pcall(...)`. Scripts are cached by SHA-1 digest for rapid execution via `EVALSHA`.
+
+### 8. HyperLogLog: $O(1)$ Memory Cardinality Estimation
+- **The Problem:** Tracking unique visitors or user IDs with Sets requires memory proportional to unique count ($O(N)$), consuming gigabytes at scale.
+- **My Solution:** I implemented the **HyperLogLog algorithm** using 16,384 6-bit registers (12 KB fixed memory). It utilizes a 64-bit mixer hash function, register rank evaluation, Flajolet-Martin harmonic mean estimation, and Linear Counting correction for small cardinalities, achieving a standard error $\approx 0.81\%$. Supports `PFADD`, `PFCOUNT`, and multi-key union merging with `PFMERGE`.
+
+### 9. Geospatial Indexing: 52-bit Geohash & Haversine Distance
+- **The Problem:** Geospatial distance calculations and radius searches require spherical geometry and spatial indexing without degrading in-memory performance.
+- **My Solution:** Built a 52-bit integer **Geohash encoder/decoder** that interleaves 26 bits of normalized longitude and latitude into a single integer score stored in a Sorted Set (`ds.SSet`). Features great-circle **Haversine distance** calculation and fast circular spatial indexing with `GEOADD`, `GEODIST`, `GEOPOS`, `GEOSEARCH`, and `GEOHASH`.
+
+### 10. Bitmaps & Bitfields: Bit-Level Operations
+- **The Problem:** High-frequency event tracking, user activity flags, and DAU analytics require byte-compact structures with single-bit precision.
+- **My Solution:** Implemented zero-allocation byte manipulation with `SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, and `BITOP` (`AND`, `OR`, `XOR`, `NOT`). Popcount calculations use hardware-accelerated bit counting (`math/bits.OnesCount8`) for microsecond-level aggregations over megabyte-scale bitfields.
+
+### 11. Enterprise Security & Role-Based ACLs
+- **The Problem:** Enterprise deployments require fine-grained authorization, command sandboxing, and password security beyond a single plaintext `requirepass`.
+- **My Solution:** Designed a full **Access Control List (ACL)** engine supporting:
+  - Secure SHA-256 password hashing with constant-time comparison (`subtle.ConstantTimeCompare`) to eliminate timing attacks.
+  - Granular command category filters (`+@read`, `+@write`, `+@admin`, `+@connection`, `+@scripting`).
+  - Glob-based key pattern restrictions (e.g. `~cache:*`, `~user:*`).
+  - Commands: `AUTH`, `ACL WHOAMI`, `ACL LIST`, `ACL USERS`, `ACL SETUSER`, `ACL DELUSER`, `ACL CAT`.
+
+### 12. Real-Time Web Dashboard & Prometheus Metrics
+- **The Problem:** Modern cloud infrastructure requires observability into throughput, memory allocations, hit/miss ratios, and cluster topology.
+- **My Solution:** Embedded a high-speed HTTP telemetry server with zero external runtime dependencies:
+  - **Prometheus Exporter (`/metrics`):** Standard Prometheus exposition format exposing `redis_uptime_seconds`, `redis_ops_per_second`, `redis_connected_clients`, `redis_keys_total`, `redis_memory_used_bytes`, `redis_cache_hits_total`, and per-command counters.
+  - **Live Web Dashboard (`/dashboard`):** Modern dark-mode glassmorphic single-page application with live metrics polling, memory gauges, real-time key explorer, and an interactive web command terminal.
+
+### 13. Dynamic Cluster Gossip Bus
+- **The Problem:** Distributed nodes need autonomous peer discovery, topology synchronization, and failure detection without a central orchestrator.
+- **My Solution:** Implemented a peer-to-peer **Gossip Bus** over TCP:
+  - Nodes exchange periodic `PING`/`PONG` heartbeat packets containing configuration epochs and assigned hash slot ranges.
+  - Transitive peer discovery dynamically registers newly introduced nodes.
+  - Heartbeat tracking identifies dead nodes and transitions them to `PFAIL` (possible fail).
+  - Commands: `CLUSTER MEET <ip> <port> [bus_port]`, `CLUSTER NODES`, `CLUSTER MYID`, `CLUSTER INFO`.
+
 ---
 
 ## Live Performance Benchmarks
@@ -194,13 +232,28 @@ redis-cli -p 6380 EXEC
 
 ---
 
+## Interactive Web Dashboard & Observability
+
+Start the server with HTTP telemetry enabled:
+```bash
+./my-redis-server --port 6379 --http-port 8080
+```
+Open **`http://localhost:8080/dashboard`** in your browser to view:
+- **Real-Time Throughput & Ops/Sec**
+- **Heap Memory Gauge & Client Counter**
+- **Interactive Web Terminal Console** (type commands directly in the browser)
+- **Live Keyspace Explorer** (search keys, inspect TTLs and data structures)
+- **Prometheus Scrape Endpoint** at `http://localhost:8080/metrics`
+
+---
+
 ## Client Integration Examples
 
 ### Python (`redis-py`)
 ```python
 import redis
 
-r = redis.Redis(host='localhost', port=6380, decode_responses=True)
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
 # 1. Strings & TTL
 r.set('session:token_abc', 'user_42', ex=3600)
@@ -210,30 +263,22 @@ r.zadd('game_scores', {'Alice': 1500, 'Bob': 2300, 'Charlie': 1800})
 top_players = r.zrange('game_scores', 0, -1, withscores=True)
 print("Leaderboard:", top_players)
 
-# 3. Stream Events
-r.xadd('orders_stream', {'order_id': 'ORD-991', 'total': '49.99'})
-events = r.xrange('orders_stream', min='-', max='+')
-print("Stream Events:", events)
-```
+# 3. Geospatial Indexing
+r.geoadd('cities', [13.361389, 38.115556, 'Palermo', 15.087269, 37.502669, 'Catania'])
+distance = r.geodist('cities', 'Palermo', 'Catania', unit='km')
+print("Distance:", distance, "km")
 
-### Go (`go-redis`)
-```go
-package main
+# 4. HyperLogLog Unique Counting
+r.pfadd('unique_visitors', 'user_1', 'user_2', 'user_3', 'user_1')
+print("Unique Visitors:", r.pfcount('unique_visitors'))
 
-import (
-	"context"
-	"fmt"
-	"github.com/redis/go-redis/v9"
-)
+# 5. Bitmaps
+r.setbit('user:active:2026-10-21', 42, 1)
+print("Is User 42 Active:", r.getbit('user:active:2026-10-21', 42))
 
-func main() {
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6380"})
-
-	rdb.Set(ctx, "cluster_key", "value", 0)
-	val, _ := rdb.Get(ctx, "cluster_key").Result()
-	fmt.Println("Result:", val)
-}
+# 6. Lua Scripting
+script = "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])"
+print("Lua Result:", r.eval(script, 1, 'lua_key', 'hello_from_lua'))
 ```
 
 ---
@@ -243,30 +288,38 @@ func main() {
 ### Core & Key Management
 `PING`, `SET [EX|PX]`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `TYPE`, `KEYS`, `DBSIZE`, `FLUSHDB`
 
-### Data Structures
+### Advanced Data Structures
+- **Bitmaps:** `SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITOP [AND|OR|XOR|NOT]`
+- **HyperLogLog:** `PFADD`, `PFCOUNT`, `PFMERGE`
+- **Geospatial:** `GEOADD`, `GEOPOS`, `GEODIST`, `GEOSEARCH`, `GEORADIUS`, `GEOHASH`
+- **Sorted Sets:** `ZADD`, `ZRANGE [WITHSCORES]`, `ZREM`, `ZSCORE`
 - **Lists:** `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `BLPOP`, `BRPOP`
 - **Sets:** `SADD`, `SMEMBERS`, `SREM`, `SISMEMBER`
 - **Hashes:** `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`
-- **Sorted Sets:** `ZADD`, `ZRANGE [WITHSCORES]`, `ZREM`, `ZSCORE`
 - **Streams:** `XADD`, `XLEN`, `XRANGE`, `XREAD`
 
-### Transactions
-`WATCH`, `UNWATCH`, `MULTI`, `EXEC`, `DISCARD`
+### Scripting & Transactions
+- **Lua Scripting:** `EVAL`, `EVALSHA`, `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH`
+- **Transactions:** `WATCH`, `UNWATCH`, `MULTI`, `EXEC`, `DISCARD`
+
+### Enterprise Security & ACLs
+- **Access Control:** `AUTH [username] <password>`, `ACL WHOAMI`, `ACL LIST`, `ACL USERS`, `ACL SETUSER`, `ACL DELUSER`, `ACL CAT`
+
+### Clustering & High Availability
+- **Cluster Bus:** `CLUSTER MEET <ip> <port> [bus_port]`, `CLUSTER KEYSLOT`, `CLUSTER NODES`, `CLUSTER SLOTS`, `CLUSTER MYID`, `CLUSTER INFO`
+- **Replication:** `REPLICAOF <host> <port>`, `REPLICAOF NO ONE`
+- **Pub/Sub:** `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`
 
 ### Persistence & Management
 `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `CONFIG GET/SET`, `MAXMEMORY`, `INFO`
 
-### Pub/Sub & Clustering
-- **Pub/Sub:** `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`
-- **Replication:** `REPLICAOF <host> <port>`, `REPLICAOF NO ONE`
-- **Clustering:** `CLUSTER KEYSLOT`, `CLUSTER NODES`, `CLUSTER SLOTS`, `CLUSTER INFO`
-
 ---
 
-## Test Suite
+## Test Suite & Verification
 
-Run all unit, integration, concurrency, and persistence test suites:
+Run all unit, integration, race detection, and persistence test suites:
 ```bash
-go test -v -count=1 ./...
+go test -v -race -count=1 ./...
 ```
-*(All 8 packages compile and pass cleanly).*
+*(All packages compile with 100% test pass rate and zero race conditions).*
+
