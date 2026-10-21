@@ -183,3 +183,30 @@ func TestBackgroundCleanup(t *testing.T) {
 		t.Fatal("key should have been cleaned up by background worker")
 	}
 }
+
+func TestShardedHighConcurrency(t *testing.T) {
+	s := New()
+	numGoroutines := 50
+	opsPerGoroutine := 500
+	done := make(chan bool, numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		go func(gid int) {
+			for i := 0; i < opsPerGoroutine; i++ {
+				key := string(rune('a'+(i%26))) + string(rune('0'+(gid%10)))
+				s.Set(key, "data")
+				s.Get(key)
+				s.Exists(key)
+			}
+			done <- true
+		}(g)
+	}
+
+	for g := 0; g < numGoroutines; g++ {
+		<-done
+	}
+	if s.Len() == 0 {
+		t.Fatal("expected non-zero keys in store")
+	}
+}
+

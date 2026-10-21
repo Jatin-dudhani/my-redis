@@ -10,7 +10,7 @@ import (
 
 func dial(t *testing.T, s *Server) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("tcp", s.ln.Addr().String())
+	conn, err := net.Dial("tcp", s.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func startServer(t *testing.T) *Server {
 	go func() {
 		s.Start()
 	}()
-	time.Sleep(50 * time.Millisecond)
+	s.WaitReady()
 	return s
 }
 

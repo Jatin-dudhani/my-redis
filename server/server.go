@@ -10,17 +10,31 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Jatin-dudhani/my-redis/aof"
+	"github.com/Jatin-dudhani/my-redis/cluster"
 	"github.com/Jatin-dudhani/my-redis/pubsub"
 	"github.com/Jatin-dudhani/my-redis/resp"
 	"github.com/Jatin-dudhani/my-redis/store"
 )
 
 type Server struct {
-	addr    string
-	dbPath  string
-	ln      net.Listener
-	store   *store.Store
-	pubsub  *pubsub.Hub
+	addr      string
+	dbPath    string
+	aofPath   string
+	aof       *aof.AOF
+	ln        net.Listener
+	ready     chan struct{}
+	store     *store.Store
+	pubsub    *pubsub.Hub
+	cluster   *cluster.Cluster
+	startTime time.Time
+
+	execMu    sync.Mutex
+	clientsMu sync.RWMutex
+	clients   map[*clientState]struct{}
+
+	waiterMu sync.Mutex
+	waiters  map[string][]chan string
 
 	replicas   map[net.Conn]struct{}
 	replicaMu  sync.Mutex
@@ -29,25 +43,93 @@ type Server struct {
 }
 
 type clientState struct {
-	inTx       bool
-	queue      []resp.Value
-	mu         sync.Mutex
-	subscribed bool
-	sub        *pubsub.Subscriber
-	channels   []string
-	isReplica  bool
+	inTx        bool
+	queue       []resp.Value
+	mu          sync.Mutex
+	subscribed  bool
+	sub         *pubsub.Subscriber
+	channels    []string
+	isReplica   bool
+	watchedKeys map[string]struct{}
+	txDirty     bool
 }
 
 func New(addr, dbPath string) *Server {
 	s := &Server{
-		addr:     addr,
-		dbPath:   dbPath,
-		store:    store.New(),
-		pubsub:   pubsub.NewHub(),
-		replicas: make(map[net.Conn]struct{}),
+		addr:      addr,
+		dbPath:    dbPath,
+		ready:     make(chan struct{}),
+		store:     store.New(),
+		pubsub:    pubsub.NewHub(),
+		replicas:  make(map[net.Conn]struct{}),
+		clients:   make(map[*clientState]struct{}),
+		waiters:   make(map[string][]chan string),
+		startTime: time.Now(),
 	}
 	s.loadDB()
 	return s
+}
+
+func (s *Server) EnableAOF(path string, policy aof.FsyncPolicy) error {
+	a, err := aof.Open(path, policy)
+	if err != nil {
+		return err
+	}
+	s.aofPath = path
+	err = a.Replay(func(v resp.Value) error {
+		s.executeCommand(v)
+		return nil
+	})
+	if err != nil {
+		a.Close()
+		return err
+	}
+	s.aof = a
+	return nil
+}
+
+func (s *Server) EnableCluster(nodeID string, startSlot, endSlot uint16) {
+	s.cluster = cluster.NewCluster(nodeID, s.addr, startSlot, endSlot)
+}
+
+func (s *Server) Cluster() *cluster.Cluster {
+	return s.cluster
+}
+
+func (s *Server) Addr() net.Addr {
+	<-s.ready
+	return s.ln.Addr()
+}
+
+func (s *Server) WaitReady() {
+	<-s.ready
+}
+
+func (s *Server) touchWatchedKey(key string) {
+	s.clientsMu.RLock()
+	defer s.clientsMu.RUnlock()
+	for cs := range s.clients {
+		cs.mu.Lock()
+		if cs.watchedKeys != nil {
+			if _, ok := cs.watchedKeys[key]; ok {
+				cs.txDirty = true
+			}
+		}
+		cs.mu.Unlock()
+	}
+}
+
+func (s *Server) notifyListWaiter(key, item string) bool {
+	s.waiterMu.Lock()
+	defer s.waiterMu.Unlock()
+	chList := s.waiters[key]
+	if len(chList) > 0 {
+		ch := chList[0]
+		s.waiters[key] = chList[1:]
+		ch <- item
+		return true
+	}
+	return false
 }
 
 func (s *Server) loadDB() {
@@ -71,6 +153,12 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen on %s: %w", s.addr, err)
 	}
 	s.ln = ln
+	select {
+	case <-s.ready:
+	default:
+		close(s.ready)
+	}
+
 	fmt.Printf("server listening on %s\n", s.addr)
 	if s.store == nil {
 		s.store = store.New()
@@ -92,6 +180,9 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() error {
 	s.store.StopCleanup()
+	if s.aof != nil {
+		_ = s.aof.Close()
+	}
 	if s.ln != nil {
 		return s.ln.Close()
 	}
@@ -100,23 +191,48 @@ func (s *Server) Stop() error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	fmt.Printf("new connection from %s\n", conn.RemoteAddr())
+	defer func() {
+		s.replicaMu.Lock()
+		delete(s.replicas, conn)
+		s.replicaMu.Unlock()
+	}()
 
 	rd := resp.NewReaderSize(conn, 65536)
 	wr := resp.NewWriterSize(conn, 65536)
-	cs := &clientState{}
+	cs := &clientState{
+		watchedKeys: make(map[string]struct{}),
+	}
+
+	s.clientsMu.Lock()
+	s.clients[cs] = struct{}{}
+	s.clientsMu.Unlock()
+
+	defer func() {
+		s.clientsMu.Lock()
+		delete(s.clients, cs)
+		s.clientsMu.Unlock()
+	}()
+
 	vch := make(chan resp.Value, 1)
 	errch := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
 
-	// goroutine to read from network
 	go func() {
 		for {
 			v, err := rd.Read()
 			if err != nil {
-				errch <- err
+				select {
+				case errch <- err:
+				case <-done:
+				}
 				return
 			}
-			vch <- v
+			select {
+			case vch <- v:
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -124,18 +240,18 @@ func (s *Server) handleConn(conn net.Conn) {
 		if cs.subscribed {
 			select {
 			case msg := <-cs.sub.Messages:
-		reply := resp.Array([]resp.Value{
-			resp.BulkString("message"),
-			resp.BulkString(msg.Channel),
-			resp.BulkString(msg.Payload),
-		})
-		if err := wr.Write(reply); err != nil {
-			return
-		}
-		if err := wr.Flush(); err != nil {
-			return
-		}
-		continue
+				reply := resp.Array([]resp.Value{
+					resp.BulkString("message"),
+					resp.BulkString(msg.Channel),
+					resp.BulkString(msg.Payload),
+				})
+				if err := wr.Write(reply); err != nil {
+					return
+				}
+				if err := wr.Flush(); err != nil {
+					return
+				}
+				continue
 			case v := <-vch:
 				s.handleSubscribedCommand(v, cs, wr)
 				continue
@@ -146,10 +262,6 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		select {
 		case <-errch:
-			// remove from replicas on disconnect
-			s.replicaMu.Lock()
-			delete(s.replicas, conn)
-			s.replicaMu.Unlock()
 			return
 		case v := <-vch:
 			if cs.isReplica {
@@ -163,13 +275,13 @@ func (s *Server) handleConn(conn net.Conn) {
 					s.replicas[conn] = struct{}{}
 					s.replicaMu.Unlock()
 					cs.isReplica = true
-				if err := wr.Write(resp.SimpleString("OK")); err != nil {
-					return
-				}
-				if err := wr.Flush(); err != nil {
-					return
-				}
-				continue
+					if err := wr.Write(resp.SimpleString("OK")); err != nil {
+						return
+					}
+					if err := wr.Flush(); err != nil {
+						return
+					}
+					continue
 				}
 			}
 
@@ -180,11 +292,9 @@ func (s *Server) handleConn(conn net.Conn) {
 
 			reply := s.processRESP(v, cs)
 			if err := wr.Write(reply); err != nil {
-				fmt.Printf("write error: %v\n", err)
 				return
 			}
 			if err := wr.Flush(); err != nil {
-				fmt.Printf("flush error: %v\n", err)
 				return
 			}
 		}
@@ -260,10 +370,30 @@ func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 	}
 	cmd := strings.ToUpper(v.Array[0].Str)
 
+	if cmd == "WATCH" {
+		if len(v.Array) < 2 {
+			return resp.Error("ERR wrong number of arguments for 'WATCH' command")
+		}
+		cs.mu.Lock()
+		for _, a := range v.Array[1:] {
+			cs.watchedKeys[a.Str] = struct{}{}
+		}
+		cs.mu.Unlock()
+		return resp.SimpleString("OK")
+	}
+
+	if cmd == "UNWATCH" {
+		cs.mu.Lock()
+		cs.watchedKeys = make(map[string]struct{})
+		cs.mu.Unlock()
+		return resp.SimpleString("OK")
+	}
+
 	if cmd == "MULTI" {
 		cs.mu.Lock()
 		cs.inTx = true
 		cs.queue = nil
+		cs.txDirty = false
 		cs.mu.Unlock()
 		return resp.SimpleString("OK")
 	}
@@ -274,17 +404,30 @@ func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 			cs.mu.Unlock()
 			return resp.Error("ERR EXEC without MULTI")
 		}
+		if cs.txDirty {
+			cs.inTx = false
+			cs.queue = nil
+			cs.watchedKeys = make(map[string]struct{})
+			cs.txDirty = false
+			cs.mu.Unlock()
+			return resp.Null() // *-1\r\n
+		}
 		queue := cs.queue
 		cs.inTx = false
 		cs.queue = nil
+		cs.watchedKeys = make(map[string]struct{})
 		cs.mu.Unlock()
+
 		if len(queue) == 0 {
 			return resp.Array(nil)
 		}
+
+		s.execMu.Lock()
 		results := make([]resp.Value, len(queue))
 		for i, qv := range queue {
 			results[i] = s.executeCommand(qv)
 		}
+		s.execMu.Unlock()
 		return resp.Array(results)
 	}
 
@@ -296,6 +439,8 @@ func (s *Server) processRESP(v resp.Value, cs *clientState) resp.Value {
 		}
 		cs.inTx = false
 		cs.queue = nil
+		cs.watchedKeys = make(map[string]struct{})
+		cs.txDirty = false
 		cs.mu.Unlock()
 		return resp.SimpleString("OK")
 	}
@@ -341,11 +486,20 @@ var writeCommands = map[string]bool{
 	"SADD": true, "SREM": true,
 	"HSET": true, "HDEL": true,
 	"ZADD": true, "ZREM": true,
+	"XADD": true, "FLUSHDB": true,
 }
 
 func (s *Server) executeCommand(v resp.Value) resp.Value {
 	cmd := strings.ToUpper(v.Array[0].Str)
 	args := v.Array[1:]
+
+	// Cluster redirection check if enabled
+	if s.cluster != nil && len(args) > 0 {
+		firstKey := args[0].Str
+		if isLocal, targetAddr, slot := s.cluster.CheckSlot(firstKey); !isLocal {
+			return resp.Error(fmt.Sprintf("MOVED %d %s", slot, targetAddr))
+		}
+	}
 
 	var reply resp.Value
 
@@ -368,6 +522,10 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 		reply = s.respTTL(args)
 	case "SAVE":
 		reply = s.respSave(args)
+	case "BGSAVE":
+		reply = s.respBGSave(args)
+	case "BGREWRITEAOF":
+		reply = s.respBGRewriteAOF(args)
 	case "CONFIG":
 		reply = s.respConfig(args)
 	case "MAXMEMORY":
@@ -382,6 +540,10 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 		reply = s.respLPop(args)
 	case "RPOP":
 		reply = s.respRPop(args)
+	case "BLPOP":
+		reply = s.respBLPop(args)
+	case "BRPOP":
+		reply = s.respBRPop(args)
 	case "LRANGE":
 		reply = s.respLRange(args)
 	case "SADD":
@@ -410,12 +572,35 @@ func (s *Server) executeCommand(v resp.Value) resp.Value {
 		reply = s.respZRem(args)
 	case "ZSCORE":
 		reply = s.respZScore(args)
+	case "XADD":
+		reply = s.respXAdd(args)
+	case "XLEN":
+		reply = s.respXLen(args)
+	case "XRANGE":
+		reply = s.respXRange(args)
+	case "XREAD":
+		reply = s.respXRead(args)
+	case "TYPE":
+		reply = s.respType(args)
+	case "KEYS":
+		reply = s.respKeys(args)
+	case "DBSIZE":
+		reply = s.respDBSize(args)
+	case "FLUSHDB":
+		reply = s.respFlushDB(args)
+	case "INFO":
+		reply = s.respInfo(args)
+	case "CLUSTER":
+		reply = s.respCluster(args)
 	default:
 		return resp.Error(fmt.Sprintf("ERR unknown command '%s'", cmd))
 	}
 
 	if writeCommands[cmd] {
 		s.propagate(v)
+		if s.aof != nil {
+			_ = s.aof.Write(v)
+		}
 	}
 
 	return reply
@@ -432,11 +617,11 @@ func (s *Server) propagate(v resp.Value) {
 	if err := w.Write(v); err != nil {
 		return
 	}
+	_ = w.Flush()
 	data := buf.String()
 	for conn := range s.replicas {
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := conn.Write([]byte(data)); err != nil {
-			fmt.Printf("replica write error: %v\n", err)
 			conn.Close()
 			delete(s.replicas, conn)
 		}
@@ -453,7 +638,6 @@ func (s *Server) respConfig(args []resp.Value) resp.Value {
 			})
 		}
 	}
-	// Minimally respond to GET/SET for benchmark compatibility
 	return resp.SimpleString("OK")
 }
 
@@ -471,7 +655,6 @@ func (s *Server) respMaxMemory(args []resp.Value) resp.Value {
 
 func (s *Server) respReplicaOf(args []resp.Value) resp.Value {
 	if len(args) == 1 && strings.ToUpper(args[0].Str) == "NO" {
-		// REPLICAOF NO ONE — become master
 		s.replicaMu.Lock()
 		if s.masterConn != nil {
 			s.masterConn.Close()
@@ -510,7 +693,6 @@ func (s *Server) replicaReceiver(conn net.Conn) {
 	for {
 		v, err := rd.Read()
 		if err != nil {
-			fmt.Printf("replica connection lost: %v\n", err)
 			s.replicaMu.Lock()
 			s.isReplica = false
 			s.masterConn = nil
@@ -555,6 +737,7 @@ func (s *Server) respSet(args []resp.Value) resp.Value {
 				return resp.Error("ERR value is not an integer or out of range")
 			}
 			s.store.SetWithTTL(key, value, time.Duration(secs)*time.Second)
+			s.touchWatchedKey(key)
 			return resp.SimpleString("OK")
 		case "PX":
 			if i+1 >= len(args) {
@@ -565,11 +748,13 @@ func (s *Server) respSet(args []resp.Value) resp.Value {
 				return resp.Error("ERR value is not an integer or out of range")
 			}
 			s.store.SetWithTTL(key, value, time.Duration(millis)*time.Millisecond)
+			s.touchWatchedKey(key)
 			return resp.SimpleString("OK")
 		}
 	}
 
 	s.store.Set(key, value)
+	s.touchWatchedKey(key)
 	return resp.SimpleString("OK")
 }
 
@@ -596,6 +781,7 @@ func (s *Server) respDel(args []resp.Value) resp.Value {
 	for _, arg := range args {
 		if s.store.Exists(arg.Str) {
 			s.store.Delete(arg.Str)
+			s.touchWatchedKey(arg.Str)
 			count++
 		}
 	}
@@ -625,6 +811,7 @@ func (s *Server) respExpire(args []resp.Value) resp.Value {
 	}
 	ok := s.store.Expire(args[0].Str, time.Duration(secs)*time.Second)
 	if ok {
+		s.touchWatchedKey(args[0].Str)
 		return resp.Integer(1)
 	}
 	return resp.Integer(0)

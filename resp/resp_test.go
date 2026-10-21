@@ -190,3 +190,29 @@ func TestMultipleReads(t *testing.T) {
 		}
 	}
 }
+
+func TestSecurityNegativeLengths(t *testing.T) {
+	// Negative bulk string should return error instead of panicking
+	r1 := NewReader(bytes.NewReader([]byte("$-2\r\n")))
+	_, err := r1.Read()
+	if err == nil {
+		t.Fatal("expected error for negative bulk string length")
+	}
+
+	// Negative array should return error instead of panicking
+	r2 := NewReader(bytes.NewReader([]byte("*-3\r\n")))
+	_, err = r2.Read()
+	if err == nil {
+		t.Fatal("expected error for negative array length")
+	}
+}
+
+func TestSecurityExcessiveLengths(t *testing.T) {
+	// Giant array length
+	r := NewReader(bytes.NewReader([]byte("*999999999\r\n")))
+	_, err := r.Read()
+	if err == nil {
+		t.Fatal("expected error for excessive array length")
+	}
+}
+

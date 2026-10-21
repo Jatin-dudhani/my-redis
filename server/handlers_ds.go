@@ -27,6 +27,18 @@ func (s *Server) respLPush(args []resp.Value) resp.Value {
 	}
 	n := list.LPush(vals...)
 	s.store.Set(key, list)
+	s.touchWatchedKey(key)
+
+	for _, item := range vals {
+		if s.notifyListWaiter(key, item) {
+			list.LPop()
+			if list.LLen() == 0 {
+				s.store.Delete(key)
+			}
+			break
+		}
+	}
+
 	return resp.Integer(int64(n))
 }
 
@@ -49,6 +61,18 @@ func (s *Server) respRPush(args []resp.Value) resp.Value {
 	}
 	n := list.RPush(vals...)
 	s.store.Set(key, list)
+	s.touchWatchedKey(key)
+
+	for _, item := range vals {
+		if s.notifyListWaiter(key, item) {
+			list.RPop()
+			if list.LLen() == 0 {
+				s.store.Delete(key)
+			}
+			break
+		}
+	}
+
 	return resp.Integer(int64(n))
 }
 
@@ -70,6 +94,7 @@ func (s *Server) respLPop(args []resp.Value) resp.Value {
 	} else {
 		s.store.Set(args[0].Str, list)
 	}
+	s.touchWatchedKey(args[0].Str)
 	return resp.BulkString(elem)
 }
 
@@ -91,6 +116,7 @@ func (s *Server) respRPop(args []resp.Value) resp.Value {
 	} else {
 		s.store.Set(args[0].Str, list)
 	}
+	s.touchWatchedKey(args[0].Str)
 	return resp.BulkString(elem)
 }
 
@@ -138,6 +164,7 @@ func (s *Server) respSAdd(args []resp.Value) resp.Value {
 	}
 	n := set.SAdd(members...)
 	s.store.Set(key, set)
+	s.touchWatchedKey(key)
 	return resp.Integer(int64(n))
 }
 
@@ -177,6 +204,7 @@ func (s *Server) respSRem(args []resp.Value) resp.Value {
 	} else {
 		s.store.Set(args[0].Str, set)
 	}
+	s.touchWatchedKey(args[0].Str)
 	return resp.Integer(int64(n))
 }
 
@@ -218,6 +246,7 @@ func (s *Server) respHSet(args []resp.Value) resp.Value {
 		hash.HSet(field, value)
 	}
 	s.store.Set(key, hash)
+	s.touchWatchedKey(key)
 	return resp.Integer(count)
 }
 
@@ -256,6 +285,7 @@ func (s *Server) respHDel(args []resp.Value) resp.Value {
 	} else {
 		s.store.Set(args[0].Str, hash)
 	}
+	s.touchWatchedKey(args[0].Str)
 	return resp.Integer(int64(n))
 }
 
@@ -319,6 +349,7 @@ func (s *Server) respZAdd(args []resp.Value) resp.Value {
 		zset.ZAdd(score, member)
 	}
 	s.store.Set(key, zset)
+	s.touchWatchedKey(key)
 	return resp.Integer(count)
 }
 
@@ -370,6 +401,7 @@ func (s *Server) respZRem(args []resp.Value) resp.Value {
 	} else {
 		s.store.Set(args[0].Str, zset)
 	}
+	s.touchWatchedKey(args[0].Str)
 	return resp.Integer(int64(n))
 }
 

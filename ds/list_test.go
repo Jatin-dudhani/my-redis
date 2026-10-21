@@ -115,3 +115,24 @@ func TestLRangeEmpty(t *testing.T) {
 		t.Fatalf("expected nil from empty list, got %v", items)
 	}
 }
+
+func TestListLargeScale(t *testing.T) {
+	l := NewList()
+	n := 50000
+	for i := 0; i < n; i++ {
+		l.RPush("item")
+	}
+	if l.LLen() != n {
+		t.Fatalf("expected len %d, got %d", n, l.LLen())
+	}
+	for i := 0; i < n; i++ {
+		val, ok := l.LPop()
+		if !ok || val != "item" {
+			t.Fatalf("pop failed at %d", i)
+		}
+	}
+	if l.LLen() != 0 {
+		t.Fatalf("expected empty list, got len %d", l.LLen())
+	}
+}
+

@@ -9,6 +9,12 @@ import (
 	"sync"
 )
 
+const (
+	maxLineLen       = 65536           // 64 KB max single line
+	maxBulkStringLen = 512 * 1024 * 1024 // 512 MB max bulk string
+	maxArrayLen      = 1024 * 1024     // 1M elements max
+)
+
 type Reader struct {
 	rd *bufio.Reader
 }
@@ -53,6 +59,9 @@ func (r *Reader) readLine() (string, error) {
 	line, err := r.rd.ReadString('\n')
 	if err != nil {
 		return "", err
+	}
+	if len(line) > maxLineLen {
+		return "", errors.New("line length exceeds maximum allowed limit")
 	}
 	if len(line) < 2 || line[len(line)-2] != '\r' {
 		return "", errors.New("missing CRLF")
@@ -100,6 +109,13 @@ func (r *Reader) readBulkString() (Value, error) {
 	if err != nil {
 		return Value{}, fmt.Errorf("invalid bulk string length: %s", line)
 	}
+	if n < 0 {
+		return Value{}, fmt.Errorf("invalid negative bulk string length: %d", n)
+	}
+	if n > maxBulkStringLen {
+		return Value{}, fmt.Errorf("bulk string length %d exceeds max %d limit", n, maxBulkStringLen)
+	}
+
 	buf := bufPool.Get().([]byte)
 	if cap(buf) < n {
 		buf = make([]byte, n)
@@ -132,6 +148,13 @@ func (r *Reader) readArray() (Value, error) {
 	if err != nil {
 		return Value{}, fmt.Errorf("invalid array length: %s", line)
 	}
+	if n < 0 {
+		return Value{}, fmt.Errorf("invalid negative array length: %d", n)
+	}
+	if n > maxArrayLen {
+		return Value{}, fmt.Errorf("array length %d exceeds max %d limit", n, maxArrayLen)
+	}
+
 	arr := make([]Value, n)
 	for i := 0; i < n; i++ {
 		v, err := r.Read()

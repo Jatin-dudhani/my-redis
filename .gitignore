@@ -7,3 +7,9 @@ my-redis-server
 echoserver
 my-redis
 *.exe
+
+# persistence artifacts
+*.aof
+*.aof.tmp
+*.json
+

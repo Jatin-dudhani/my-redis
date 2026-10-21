@@ -1,6 +1,9 @@
 package ds
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestNewSSet(t *testing.T) {
 	z := NewSSet()
@@ -118,3 +121,38 @@ func TestZCard(t *testing.T) {
 		t.Fatalf("expected 2, got %d", z.ZCard())
 	}
 }
+
+func TestZSetTieBreaking(t *testing.T) {
+	z := NewSSet()
+	z.ZAdd(10, "charlie")
+	z.ZAdd(10, "alice")
+	z.ZAdd(10, "bob")
+	items := z.ZRange(0, -1, false)
+	if len(items) != 3 || items[0] != "alice" || items[1] != "bob" || items[2] != "charlie" {
+		t.Fatalf("expected lexicographical ordering for equal scores: got %v", items)
+	}
+}
+
+func TestZSetLargeScale(t *testing.T) {
+	z := NewSSet()
+	count := 1000
+	for i := count; i > 0; i-- {
+		z.ZAdd(float64(i), fmt.Sprintf("elem_%04d", i))
+	}
+	if z.ZCard() != count {
+		t.Fatalf("expected card %d, got %d", count, z.ZCard())
+	}
+	// range first 10
+	items := z.ZRange(0, 9, false)
+	if len(items) != 10 || items[0] != "elem_0001" || items[9] != "elem_0010" {
+		t.Fatalf("range first 10 mismatch: got %v", items)
+	}
+	// delete middle 500
+	for i := 250; i <= 750; i++ {
+		z.ZRem(fmt.Sprintf("elem_%04d", i))
+	}
+	if z.ZCard() != count-501 {
+		t.Fatalf("expected card %d after delete, got %d", count-501, z.ZCard())
+	}
+}
+

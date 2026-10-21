@@ -2,37 +2,50 @@ package ds
 
 import (
 	"fmt"
-	"sort"
 	"sync"
 )
 
 type SSet struct {
-	mu      sync.RWMutex
-	items   map[string]float64 // member -> score
+	mu   sync.RWMutex
+	dict map[string]float64
+	sl   *skipList
 }
 
-type zsetEntry struct {
+type ZSetEntry struct {
 	Member string
 	Score  float64
 }
 
 func NewSSet() *SSet {
-	return &SSet{items: make(map[string]float64)}
+	return &SSet{
+		dict: make(map[string]float64),
+		sl:   newSkipList(),
+	}
 }
 
 func (z *SSet) ZAdd(score float64, member string) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	z.items[member] = score
+
+	if oldScore, exists := z.dict[member]; exists {
+		if oldScore == score {
+			return
+		}
+		z.sl.delete(oldScore, member)
+	}
+	z.dict[member] = score
+	z.sl.insert(score, member)
 }
 
 func (z *SSet) ZRem(members ...string) int {
 	z.mu.Lock()
 	defer z.mu.Unlock()
+
 	count := 0
 	for _, m := range members {
-		if _, ok := z.items[m]; ok {
-			delete(z.items, m)
+		if score, ok := z.dict[m]; ok {
+			z.sl.delete(score, m)
+			delete(z.dict, m)
 			count++
 		}
 	}
@@ -42,60 +55,76 @@ func (z *SSet) ZRem(members ...string) int {
 func (z *SSet) ZScore(member string) (float64, bool) {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-	score, ok := z.items[member]
+
+	score, ok := z.dict[member]
 	return score, ok
 }
 
 func (z *SSet) ZCard() int {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-	return len(z.items)
+
+	return z.sl.length
 }
 
 func (z *SSet) ZRange(start, stop int, withScores bool) []string {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-	if len(z.items) == 0 {
+
+	length := z.sl.length
+	if length == 0 {
 		return nil
 	}
-	entries := make([]zsetEntry, 0, len(z.items))
-	for member, score := range z.items {
-		entries = append(entries, zsetEntry{member, score})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Score != entries[j].Score {
-			return entries[i].Score < entries[j].Score
-		}
-		return entries[i].Member < entries[j].Member
-	})
+
 	if start < 0 {
-		start = len(entries) + start
+		start = length + start
 	}
 	if stop < 0 {
-		stop = len(entries) + stop
+		stop = length + stop
 	}
 	if start < 0 {
 		start = 0
 	}
-	if stop >= len(entries) {
-		stop = len(entries) - 1
+	if stop >= length {
+		stop = length - 1
 	}
-	if start > stop || start >= len(entries) {
+	if start > stop || start >= length {
 		return nil
 	}
-	slice := entries[start : stop+1]
+
+	// 1-based rank
+	rank := start + 1
+	node := z.sl.getElementByRank(rank)
+	count := stop - start + 1
+
 	if withScores {
-		result := make([]string, 0, len(slice)*2)
-		for _, e := range slice {
-			result = append(result, e.Member, floatToStr(e.Score))
+		result := make([]string, 0, count*2)
+		for i := 0; i < count && node != nil; i++ {
+			result = append(result, node.member, floatToStr(node.score))
+			node = node.level[0].forward
 		}
 		return result
 	}
-	result := make([]string, len(slice))
-	for i, e := range slice {
-		result[i] = e.Member
+
+	result := make([]string, 0, count)
+	for i := 0; i < count && node != nil; i++ {
+		result = append(result, node.member)
+		node = node.level[0].forward
 	}
 	return result
+}
+
+func (z *SSet) Entries() []ZSetEntry {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+
+	entries := make([]ZSetEntry, 0, z.sl.length)
+	node := z.sl.header.level[0].forward
+	for node != nil {
+		entries = append(entries, ZSetEntry{Member: node.member, Score: node.score})
+		node = node.level[0].forward
+	}
+	return entries
 }
 
 func floatToStr(f float64) string {
